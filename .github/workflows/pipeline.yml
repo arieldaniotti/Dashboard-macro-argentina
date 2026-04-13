@@ -18,9 +18,16 @@ jobs:
           python-version: '3.11'
 
       - name: Instalar dependencias
+        run: pip install yfinance requests gspread google-auth pandas
+
+      - name: Verificar archivo
         run: |
-          pip uninstall pandas-datareader -y
-          pip install yfinance requests gspread google-auth pandas
+          echo "Directorio actual:"
+          pwd
+          echo "Archivos:"
+          ls -la
+          echo "Primeras lineas del pipeline:"
+          head -10 pipeline_actions.py
 
       - name: Crear credenciales de Google
         run: echo '${{ secrets.GCLOUD_SERVICE_ACCOUNT }}' > credentials.json
