@@ -10,15 +10,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Clonar repositorio
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Configurar Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: Instalar dependencias
-        run: pip install yfinance requests pandas-datareader gspread google-auth pandas
+        run: |
+          pip install yfinance requests gspread google-auth pandas
+          pip install pandas-datareader==0.10.0
+          pip install pandas==2.0.3
 
       - name: Crear credenciales de Google
         run: echo '${{ secrets.GCLOUD_SERVICE_ACCOUNT }}' > credentials.json
