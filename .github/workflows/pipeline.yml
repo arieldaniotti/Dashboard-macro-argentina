@@ -1,0 +1,29 @@
+name: Pipeline diario
+
+on:
+  schedule:
+    - cron: '0 11 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clonar repositorio
+        uses: actions/checkout@v3
+
+      - name: Configurar Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependencias
+        run: pip install yfinance requests pandas-datareader gspread google-auth pandas
+
+      - name: Crear credenciales de Google
+        run: echo '${{ secrets.GCLOUD_SERVICE_ACCOUNT }}' > credentials.json
+
+      - name: Correr pipeline
+        run: python pipeline_actions.py
+        env:
+          SHEET_NAME: ${{ secrets.SHEET_NAME }}
