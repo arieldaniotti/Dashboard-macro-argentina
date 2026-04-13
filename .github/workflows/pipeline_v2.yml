@@ -1,0 +1,31 @@
+name: Pipeline macro v2
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 11 * * 1-5'
+
+jobs:
+  ejecutar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: ''
+
+      - name: Instalar
+        run: pip install --no-cache-dir yfinance requests gspread google-auth pandas
+
+      - name: Ver archivo
+        run: cat pipeline_v2.py | head -10
+
+      - name: Credenciales
+        run: echo '${{ secrets.GCLOUD_SERVICE_ACCOUNT }}' > credentials.json
+
+      - name: Correr
+        run: python pipeline_v2.py
+        env:
+          SHEET_NAME: ${{ secrets.SHEET_NAME }}
