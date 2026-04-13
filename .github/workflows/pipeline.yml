@@ -8,28 +8,31 @@ on:
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+
     steps:
       - name: Clonar repositorio
         uses: actions/checkout@v4
+        with:
+          path: .
 
       - name: Configurar Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
+      - name: Verificar archivo
+        run: |
+          pwd
+          ls -la
+          head -8 pipeline_actions.py
+
       - name: Instalar dependencias
         run: pip install yfinance requests gspread google-auth pandas
 
-      - name: Verificar archivo
-        run: |
-          echo "Directorio actual:"
-          pwd
-          echo "Archivos:"
-          ls -la
-          echo "Primeras lineas del pipeline:"
-          head -10 pipeline_actions.py
-
-      - name: Crear credenciales de Google
+      - name: Crear credenciales
         run: echo '${{ secrets.GCLOUD_SERVICE_ACCOUNT }}' > credentials.json
 
       - name: Correr pipeline
