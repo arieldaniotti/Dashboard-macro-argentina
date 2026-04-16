@@ -24,7 +24,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 2. CONEXIÓN A LA BASE DE DATOS (VERSIÓN ROBUSTA)
+# 2. CONEXIÓN A LA BASE DE DATOS (SEGURA)
 # ==========================================
 @st.cache_data(ttl=3600)
 def load_data():
@@ -33,19 +33,15 @@ def load_data():
     client = gspread.authorize(creds)
     sh = client.open("Dashboard Macro")
     
-    # Función auxiliar para lectura segura (evita crashes por columnas vacías)
+    # Lectura cruda para evitar errores de formato en Sheets
     def safe_read(sheet_name):
         try:
             ws = sh.worksheet(sheet_name)
             data = ws.get_all_values()
-            if len(data) > 1:
-                return pd.DataFrame(data[1:], columns=data[0])
+            if len(data) > 1: return pd.DataFrame(data[1:], columns=data[0])
             return pd.DataFrame()
-        except Exception as e:
-            st.error(f"Error leyendo {sheet_name}: {e}")
-            return pd.DataFrame()
+        except: return pd.DataFrame()
 
-    # Leemos todas las pestañas de forma segura
     df_res = safe_read("DB_Resumen")
     df_ai = safe_read("DB_Insights")
     df_macro = safe_read("DB_Macro")
@@ -61,10 +57,8 @@ df_resumen, df_insights, df_macro, df_hist = load_data()
 st.title("📊 Dashboard Económico Financiero")
 st.caption("Actualización diaria mediante pipeline automático.")
 
-# Creamos las 5 solapas
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["📌 Resumen", "🌎 Macro Global", "🇦🇷 Argentina", "🏗️ Inmobiliario", "💼 Portafolio"])
 
-# Función para tarjetas de métricas
 def render_metric(label, value, delta):
     color_class = "metric-delta-up" if float(delta) >= 0 else "metric-delta-down"
     arrow = "▲" if float(delta) >= 0 else "▼"
@@ -80,21 +74,13 @@ def get_val(df, metrica):
     try:
         row = df[df['Metrica'] == metrica]
         return row['Valor_Actual'].values[0], row['Delta_1D_%'].values[0]
-    except:
-        return "N/A", 0
+    except: return "N/A", 0
 
-# ------------------------------------------
-# TAB 1: RESUMEN Y FLASH IA
-# ------------------------------------------
+# --- TAB 1: RESUMEN ---
 with tab1:
     if not df_insights.empty:
         texto_ia = df_insights['Analisis_LLM'].iloc[-1]
-        st.markdown(f"""
-            <div class="ai-box">
-                <div class="ai-title">🤖 Análisis IA — Flash del Mercado</div>
-                <div class="ai-text">{texto_ia.replace(chr(10), '<br>')}</div>
-            </div>
-        """, unsafe_allow_html=True)
+        st.markdown(f'<div class="ai-box"><div class="ai-title">🤖 Análisis IA — Flash del Mercado</div><div class="ai-text">{texto_ia.replace(chr(10), "<br>")}</div></div>', unsafe_allow_html=True)
 
     st.subheader("Mercados")
     col1, col2, col3, col4, col5 = st.columns(5)
@@ -111,48 +97,49 @@ with tab1:
     with col4: st.markdown(render_metric("Riesgo País", f"{rp_v}", rp_d), unsafe_allow_html=True)
     with col5: st.markdown(render_metric("Brecha Cambiaria", f"{brecha_v}%", brecha_d), unsafe_allow_html=True)
 
-# ------------------------------------------
-# TAB 2: MACRO GLOBAL
-# ------------------------------------------
+# --- TAB 2: MACRO GLOBAL ---
 with tab2:
     st.subheader("Contexto Internacional y Tasas")
     col1, col2 = st.columns(2)
-    
     if not df_macro.empty:
         with col1:
             st.markdown("**Evolución Tasa FED vs SELIC (Brasil)**")
-            fig_tasas = px.line(df_macro, x='fecha', y=['FEDFUNDS', 'Tasa_SELIC_Brasil'], 
-                                template='plotly_dark', color_discrete_sequence=['#38bdf8', '#34d399'])
-            fig_tasas.update_layout(legend_title_text='Tasa')
-            st.plotly_chart(fig_tasas, use_container_width=True)
-            
+            tasas_cols = [c for c in ['FEDFUNDS', 'Tasa_SELIC_Brasil'] if c in df_macro.columns]
+            if tasas_cols:
+                for c in tasas_cols: df_macro[c] = pd.to_numeric(df_macro[c], errors='coerce')
+                fig_tasas = px.line(df_macro, x='fecha', y=tasas_cols, template='plotly_dark', color_discrete_sequence=['#38bdf8', '#34d399'])
+                st.plotly_chart(fig_tasas, use_container_width=True)
+            else:
+                st.info("Datos de tasas no disponibles temporalmente.")
+                
         with col2:
             st.markdown("**Yield Curve (10Y - 2Y)**")
-            fig_yield = px.area(df_macro, x='fecha', y='T10Y2Y', template='plotly_dark', color_discrete_sequence=['#f59e0b'])
-            st.plotly_chart(fig_yield, use_container_width=True)
+            if 'T10Y2Y' in df_macro.columns:
+                df_macro['T10Y2Y'] = pd.to_numeric(df_macro['T10Y2Y'], errors='coerce')
+                fig_yield = px.area(df_macro, x='fecha', y='T10Y2Y', template='plotly_dark', color_discrete_sequence=['#f59e0b'])
+                st.plotly_chart(fig_yield, use_container_width=True)
+            else:
+                st.info("Datos de Yield Curve no disponibles temporalmente.")
 
-# ------------------------------------------
-# TAB 3: ARGENTINA
-# ------------------------------------------
+# --- TAB 3: ARGENTINA ---
 with tab3:
     st.subheader("Variables Monetarias Locales")
     if not df_hist.empty:
         st.markdown("**Dólar Oficial vs Blue vs CCL**")
-        fig_usd = px.line(df_hist, x='fecha', y=['USD_Oficial', 'USD_Blue', 'CCL'], 
-                          template='plotly_dark', color_discrete_sequence=['#94a3b8', '#38bdf8', '#34d399'])
-        fig_usd.update_layout(legend_title_text='Tipo de Cambio')
-        st.plotly_chart(fig_usd, use_container_width=True)
+        usd_cols = [c for c in ['USD_Oficial', 'USD_Blue', 'CCL'] if c in df_hist.columns]
+        if usd_cols:
+            for c in usd_cols: df_hist[c] = pd.to_numeric(df_hist[c], errors='coerce')
+            fig_usd = px.line(df_hist, x='fecha', y=usd_cols, template='plotly_dark', color_discrete_sequence=['#94a3b8', '#38bdf8', '#34d399'])
+            st.plotly_chart(fig_usd, use_container_width=True)
+        else:
+            st.info("Datos de dólares no disponibles temporalmente.")
 
-# ------------------------------------------
-# TAB 4: INMOBILIARIO
-# ------------------------------------------
+# --- TAB 4: INMOBILIARIO ---
 with tab4:
     st.subheader("Mercado Inmobiliario")
-    st.info("💡 Espacio reservado para el módulo de Real Estate. Aquí conectaremos los datos de Costo de Construcción y Valor del M2.")
+    st.info("💡 Espacio reservado para el módulo de Real Estate.")
 
-# ------------------------------------------
-# TAB 5: PORTAFOLIO
-# ------------------------------------------
+# --- TAB 5: PORTAFOLIO ---
 with tab5:
     st.subheader("Portafolio de Inversión")
-    st.info("💡 Espacio reservado para Asset Allocation, TIR y métricas de riesgo personalizadas.")
+    st.info("💡 Espacio reservado para Asset Allocation.")
