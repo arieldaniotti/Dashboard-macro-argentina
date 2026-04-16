@@ -15,11 +15,9 @@ st.markdown("""
     .stApp { background-color: #07090f; color: #e2e8f0; font-family: sans-serif; }
     
     /* Nuevas Tarjetas de Resumen */
-    .metric-card { background-color: #0b0e18; border: 1px solid #1e293b; border-radius: 8px; padding: 16px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); }
-    .m-title { font-size: 13px; color: #94a3b8; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 8px; }
-    .m-val { font-size: 24px; color: #f8fafc; font-weight: 700; font-family: 'Courier New', monospace; margin-bottom: 15px; }
-    
-    /* MODIFICACIÓN: Porcentajes más grandes y destacados */
+    .metric-card { background-color: #0b0e18; border: 1px solid #1e293b; border-radius: 8px; padding: 20px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); }
+    .m-title { font-size: 16px; color: #cbd5e1; font-weight: 800; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 10px; }
+    .m-val { font-size: 28px; color: #f8fafc; font-weight: 700; font-family: 'Courier New', monospace; margin-bottom: 15px; }
     .m-deltas { display: flex; justify-content: space-between; font-size: 18px; font-weight: 800; padding-top: 12px; border-top: 1px solid #1e293b; }
     .d-up { color: #10b981; } /* Verde Esmeralda */
     .d-down { color: #ef4444; } /* Rojo */
