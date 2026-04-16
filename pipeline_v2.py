@@ -12,7 +12,7 @@ import time
 # ==========================================
 # 1. CONFIGURACIÓN Y SEGURIDAD (GitHub Secrets)
 # ==========================================
-print("🚀 Iniciando Pipeline Automatizado V4.1...")
+print("🚀 Iniciando Pipeline Automatizado V4.1 (Prompt Mejorado)...")
 
 FRED_API_KEY   = os.environ.get("FRED_API_KEY")
 CHILE_USER     = os.environ.get("CHILE_USER")
@@ -157,17 +157,28 @@ df_macro_sheet['fecha'] = df_macro_sheet['fecha'].dt.strftime("%d/%m/%Y")
 write_ws(sh, "DB_Macro", df_macro_sheet)
 
 # ==========================================
-# 5. CEREBRO IA (Gemini)
+# 5. CEREBRO IA (Gemini - Prompt Estratega Jefe)
 # ==========================================
 print("🧠 Generando análisis IA...")
-prompt = f"Sos un analista financiero senior. Hoy es {hoy.strftime('%d/%m/%Y')}. Datos clave: S&P 500 {df_final['SP500'].iloc[-1]}, Riesgo País {df_final['Riesgo_Pais'].iloc[-1]}, Brecha {df_final['Brecha_CCL'].iloc[-1]}%. Redactá un flash de mercado de 3 párrafos cortos (Global, Local, Clave hoy). Estilo Bloomberg, sin markdown."
+prompt = f"""
+Sos el Estratega Jefe de un fondo de inversión top tier. Hoy es {hoy.strftime('%d/%m/%Y')}. 
+El mercado cerró con el S&P en {df_final['SP500'].iloc[-1]}, Brent en {df_final['Brent'].iloc[-1]}, Oro en {df_final['Oro'].iloc[-1]}, Riesgo País ARG en {df_final['Riesgo_Pais'].iloc[-1]} y Brecha Cambiaria en {df_final['Brecha_CCL'].iloc[-1]}%.
+
+REGLA DE ORO 1: NO repitas los números crudos en el texto, el cliente ya los está viendo en el tablero.
+REGLA DE ORO 2: Tu trabajo es INTERPRETAR el por qué de los movimientos.
+
+Redactá un "Flash de Mercado" de 3 párrafos cortos (Estilo Bloomberg/Wall Street Journal, tono sofisticado, crudo y directo, sin formato markdown ni negritas):
+1. Panorama Global: Analizá los drivers detrás del mercado de hoy. Relacioná los movimientos del S&P, Oro y Petróleo con el contexto geopolítico actual (riesgos de escaladas bélicas, tensiones en Medio Oriente o Europa) y las expectativas de tasas de la FED.
+2. Panorama Argentina: Analizá la coyuntura local. Explicá qué significa el nivel actual del Riesgo País y la Brecha Cambiaria en relación a la política fiscal del gobierno, el cepo cambiario y la dinámica de reservas del BCRA.
+3. Proyección/Alerta: Una frase final contundente sobre qué variable macro o geopolítica vigilar de cerca mañana.
+"""
 url_ai = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={GEMINI_API_KEY}"
 try:
     res = requests.post(url_ai, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=20)
     texto_ia = res.json()['candidates'][0]['content']['parts'][0]['text']
     df_ai = pd.DataFrame([["Fecha", "Analisis_LLM"], [hoy.strftime('%d/%m/%Y'), texto_ia]])
     write_ws(sh, "DB_Insights", df_ai)
-    print("✅ IA Finalizada.")
+    print("✅ IA Finalizada y guardada en Sheets.")
 except Exception as e:
     print(f"⚠️ Error en IA: {e}")
 
