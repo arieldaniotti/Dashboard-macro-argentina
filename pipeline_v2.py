@@ -12,7 +12,7 @@ import time
 # ==========================================
 # 1. CONFIGURACIÓN Y SEGURIDAD (GitHub Secrets)
 # ==========================================
-print("🚀 Iniciando Pipeline Automatizado V4.1 (Prompt Mejorado)...")
+print("🚀 Iniciando Pipeline Automatizado V4.2 (Fijado IA)...")
 
 FRED_API_KEY   = os.environ.get("FRED_API_KEY")
 CHILE_USER     = os.environ.get("CHILE_USER")
@@ -157,7 +157,7 @@ df_macro_sheet['fecha'] = df_macro_sheet['fecha'].dt.strftime("%d/%m/%Y")
 write_ws(sh, "DB_Macro", df_macro_sheet)
 
 # ==========================================
-# 5. CEREBRO IA (Gemini - Prompt Estratega Jefe)
+# 5. CEREBRO IA (Gemini - Formato Corregido)
 # ==========================================
 print("🧠 Generando análisis IA...")
 prompt = f"""
@@ -168,18 +168,25 @@ REGLA DE ORO 1: NO repitas los números crudos en el texto, el cliente ya los es
 REGLA DE ORO 2: Tu trabajo es INTERPRETAR el por qué de los movimientos.
 
 Redactá un "Flash de Mercado" de 3 párrafos cortos (Estilo Bloomberg/Wall Street Journal, tono sofisticado, crudo y directo, sin formato markdown ni negritas):
-1. Panorama Global: Analizá los drivers detrás del mercado de hoy. Relacioná los movimientos del S&P, Oro y Petróleo con el contexto geopolítico actual (riesgos de escaladas bélicas, tensiones en Medio Oriente o Europa) y las expectativas de tasas de la FED.
+1. Panorama Global: Analizá los drivers detrás del mercado de hoy. Relacioná los movimientos del S&P, Oro y Petróleo con el contexto geopolítico actual (riesgos de escaladas bélicas, Medio Oriente o Europa) y las expectativas de tasas de la FED.
 2. Panorama Argentina: Analizá la coyuntura local. Explicá qué significa el nivel actual del Riesgo País y la Brecha Cambiaria en relación a la política fiscal del gobierno, el cepo cambiario y la dinámica de reservas del BCRA.
 3. Proyección/Alerta: Una frase final contundente sobre qué variable macro o geopolítica vigilar de cerca mañana.
 """
 url_ai = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={GEMINI_API_KEY}"
 try:
     res = requests.post(url_ai, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=20)
+    res.raise_for_status() # Fuerza a que nos diga si hay error
     texto_ia = res.json()['candidates'][0]['content']['parts'][0]['text']
-    df_ai = pd.DataFrame([["Fecha", "Analisis_LLM"], [hoy.strftime('%d/%m/%Y'), texto_ia]])
+    
+    # MATRIZ CORREGIDA: Creamos el DataFrame como diccionario para que Google Sheets no se maree
+    df_ai = pd.DataFrame({
+        "Fecha": [hoy.strftime('%d/%m/%Y')],
+        "Analisis_LLM": [texto_ia]
+    })
     write_ws(sh, "DB_Insights", df_ai)
     print("✅ IA Finalizada y guardada en Sheets.")
 except Exception as e:
-    print(f"⚠️ Error en IA: {e}")
+    print(f"⚠️ Error crítico en IA: {e}")
+    if 'res' in locals(): print(res.text)
 
 print("🏁 Pipeline completado con éxito.")
