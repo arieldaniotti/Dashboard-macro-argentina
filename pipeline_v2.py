@@ -1,100 +1,187 @@
-
 import os
-import yfinance as yf
+import json
 import requests
+import yfinance as yf
+import pandas as pd
 import gspread
-from google.oauth2 import service_account
+from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta
+import numpy as np
+import time
 
-def get_precio(ticker):
+# ==========================================
+# 1. CONFIGURACIÓN Y SEGURIDAD (GitHub Secrets)
+# ==========================================
+print("🚀 Iniciando Pipeline Automatizado V4.1...")
+
+# Traemos las claves desde la bóveda de GitHub (Secrets)
+FRED_API_KEY   = os.environ.get("FRED_API_KEY")
+CHILE_USER     = os.environ.get("CHILE_USER")
+CHILE_PASS     = os.environ.get("CHILE_PASS")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+
+# Conexión a Google Sheets usando tu secreto GCLOUD_SERVICE_ACCOUNT
+try:
+    gcp_json = os.environ.get("GCLOUD_SERVICE_ACCOUNT")
+    creds_dict = json.loads(gcp_json)
+    scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    gc = gspread.authorize(creds)
+    # Abrimos el archivo por su nombre (Asegurate que el robot esté invitado como editor)
+    sh = gc.open("Dashboard Macro")
+except Exception as e:
+    raise RuntimeError(f"❌ Error crítico de autenticación con Google Cloud: {e}")
+
+hoy          = datetime.today()
+hace_1a      = hoy - timedelta(days=365)
+fecha_inicio = hace_1a.strftime("%Y-%m-%d")
+
+# ==========================================
+# 2. FUNCIONES DE EXTRACCIÓN
+# ==========================================
+def fetch_api_data(url):
+    headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        return round(yf.Ticker(ticker).fast_info["last_price"], 2)
-    except:
-        return None
+        res = requests.get(url, headers=headers, timeout=20)
+        res.raise_for_status()
+        return res.json()
+    except Exception as e:
+        print(f"⚠️ Error en API {url.split('/')[2]}: {e}")
+        return []
 
-def get_fred(serie):
+def get_fred_series(series_id, api_key, start_date):
+    url = f"https://api.stlouisfed.org/fred/series/observations?series_id={series_id}&api_key={api_key}&file_type=json&observation_start={start_date}"
+    data = fetch_api_data(url)
+    if data and 'observations' in data:
+        df = pd.DataFrame(data['observations'])[['date', 'value']]
+        df = df[df['value'] != '.'].copy()
+        df['value'] = df['value'].astype(float)
+        df['date'] = pd.to_datetime(df['date'])
+        df.rename(columns={'date': 'fecha', 'value': series_id}, inplace=True)
+        return df
+    return pd.DataFrame(columns=['fecha', series_id])
+
+def get_bcb_data(serie_id, nombre_columna):
+    url = f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{serie_id}/dados?formato=json"
     try:
-        url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={serie}"
-        lineas = requests.get(url).text.strip().split("\n")
-        ultimo = lineas[-1].split(",")
-        return float(ultimo[1])
+        res = requests.get(url, timeout=20) 
+        res.raise_for_status()
+        df = pd.DataFrame(res.json())
+        df['data'] = pd.to_datetime(df['data'], format='%d/%m/%Y')
+        df['valor'] = df['valor'].astype(float)
+        return df.rename(columns={'data': 'fecha', 'valor': nombre_columna})
     except:
-        return None
+        return pd.DataFrame(columns=['fecha', nombre_columna])
 
-def run():
-    hoy = datetime.today()
-    print(f"Iniciando — {hoy.strftime('%d/%m/%Y %H:%M')}")
-
-    # Mercados globales
-    sp500  = get_precio("^GSPC")
-    nasdaq = get_precio("^NDX")
-    oro    = get_precio("GC=F")
-    brent  = get_precio("BZ=F")
-    btc    = get_precio("BTC-USD")
-    print("✓ Mercados globales")
-
-    # Argentina
-    data     = requests.get("https://api.bluelytics.com.ar/v2/latest").json()
-    oficial  = data["oficial"]["value_sell"]
-    blue     = data["blue"]["value_sell"]
-    ggal_ars = yf.Ticker("GGAL.BA").fast_info["last_price"]
-    ggal_usd = yf.Ticker("GGAL").fast_info["last_price"]
-    ccl      = round((ggal_ars * 10) / ggal_usd, 2)
-    brecha   = round((ccl / oficial - 1) * 100, 2)
-    print("✓ Argentina")
-
-    # Macro USA — directo desde FRED sin librería
-    cpi_ahora = get_fred("CPIAUCSL")
-    tasa      = get_fred("FEDFUNDS")
-    gs10      = get_fred("GS10")
-    gs2       = get_fred("GS2")
-
-    # Para inflacion YoY necesitamos el valor de hace 12 meses
-    # Usamos una aproximacion con los ultimos dos valores disponibles
-    url_cpi = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=CPIAUCSL&vintage_date=" + (hoy - timedelta(days=365)).strftime("%Y-%m-%d")
+def get_chile_data(series_id, nombre_columna, user, password, start_date):
+    url = f"https://si3.bcentral.cl/SieteRestWS/SieteRestWS.ashx?user={user}&pass={password}&firstdate={start_date}&timeseries={series_id}&function=GetSeries"
     try:
-        lineas   = requests.get(url_cpi).text.strip().split("\n")
-        cpi_hace = float(lineas[-1].split(",")[1])
-        infl     = round((cpi_ahora / cpi_hace - 1) * 100, 2)
+        data = fetch_api_data(url)
+        if data and data.get("CodigoError") == 0:
+            obs = data.get("Series", {}).get("Obs", [])
+            if obs:
+                df = pd.DataFrame(obs)
+                df['fecha'] = pd.to_datetime(df['indexDateString'], format='%d-%m-%Y')
+                df['valor'] = pd.to_numeric(df['value'], errors='coerce')
+                return df[['fecha', 'valor']].rename(columns={'valor': nombre_columna})
     except:
-        infl = None
+        pass
+    return pd.DataFrame(columns=['fecha', nombre_columna])
 
-    yc = round(gs10 - gs2, 2) if gs10 and gs2 else None
-    tr = round(tasa - infl, 2) if tasa and infl else None
-    print("✓ Macro USA")
+# ==========================================
+# 3. PROCESO DE DATOS
+# ==========================================
+print("📥 Descargando datos (Arg, Global, Macro)...")
 
-    # Portafolio
-    meli  = get_precio("MELI")
-    nvda  = get_precio("NVDA")
-    msft  = get_precio("MSFT")
-    googl = get_precio("GOOGL")
-    ypf   = get_precio("YPF")
-    vist  = get_precio("VIST")
-    pam   = get_precio("PAM")
-    ggal  = get_precio("GGAL")
-    print("✓ Portafolio")
+# Argentina
+df_blue = pd.DataFrame(fetch_api_data("https://api.argentinadatos.com/v1/cotizaciones/dolares/blue")).rename(columns={"venta":"USD_Blue"})
+df_oficial = pd.DataFrame(fetch_api_data("https://api.argentinadatos.com/v1/cotizaciones/dolares/oficial")).rename(columns={"venta":"USD_Oficial"})
+df_rp = pd.DataFrame(fetch_api_data("https://api.argentinadatos.com/v1/finanzas/indices/riesgo-pais")).rename(columns={"valor":"Riesgo_Pais"})
 
-    # Google Sheets
-    credenciales = service_account.Credentials.from_service_account_file(
-        "credentials.json",
-        scopes=[
-            "https://spreadsheets.google.com/feeds",
-            "https://www.googleapis.com/auth/drive",
-        ],
-    )
-    gc   = gspread.authorize(credenciales)
-    sh   = gc.open(os.environ["SHEET_NAME"])
-    hoja = sh.sheet1
+# Limpieza básica
+for df in [df_blue, df_oficial, df_rp]:
+    if not df.empty: df["fecha"] = pd.to_datetime(df["fecha"])
 
-    fila = [
-        hoy.strftime("%d/%m/%Y"), hoy.strftime("%H:%M"),
-        sp500, nasdaq, oro, brent, btc,
-        oficial, blue, ccl, brecha,
-        infl, tasa, tr, yc,
-        meli, nvda, msft, googl,
-        ypf, vist, pam, ggal
-    ]
-    hoja.append_row(fila)
-    print(f"✓ Guardado — {hoy.strftime('%d/%m/%Y %H:%M')}")
+df_arg = df_oficial[["fecha", "USD_Oficial"]].merge(df_blue[["fecha", "USD_Blue"]], on="fecha", how="outer")
+df_arg = df_arg.merge(df_rp[["fecha", "Riesgo_Pais"]], on="fecha", how="left")
+df_arg = df_arg[df_arg["fecha"] >= fecha_inicio]
 
-run()
+# Mercados Yahoo
+tickers = {"SP500":"^GSPC", "Merval":"^MERV", "Oro":"GC=F", "Brent":"BZ=F", "BTC":"BTC-USD", "GGAL_ADR":"GGAL", "GGAL_LOC":"GGAL.BA"}
+df_mercado = pd.DataFrame()
+for col, ticker in tickers.items():
+    t = yf.download(ticker, start=fecha_inicio, progress=False, auto_adjust=True)
+    if not t.empty:
+        df_mercado[col] = t["Close"]
+
+df_mercado = df_mercado.reset_index().rename(columns={"Date":"fecha"})
+df_mercado["fecha"] = pd.to_datetime(df_mercado["fecha"]).dt.tz_localize(None)
+
+# Macro Regional
+df_fed = get_fred_series('FEDFUNDS', FRED_API_KEY, fecha_inicio)
+df_yield = get_fred_series('T10Y2Y', FRED_API_KEY, fecha_inicio)
+df_selic = get_bcb_data("11", "Tasa_SELIC_Brasil")
+df_tpm_chile = get_chile_data("F073.TCO.PRE.Z.D", "Tasa_TPM_Chile", CHILE_USER, CHILE_PASS, fecha_inicio)
+
+# Unificación
+df_final = df_mercado.merge(df_arg, on="fecha", how="outer").sort_values("fecha")
+for df_m in [df_fed, df_yield, df_selic, df_tpm_chile]:
+    if not df_m.empty: df_final = df_final.merge(df_m, on='fecha', how='left')
+
+df_final = df_final.ffill()
+
+# Ingeniería de variables
+df_final["CCL"] = (df_final["GGAL_LOC"] / (df_final["GGAL_ADR"] / 10)).round(2)
+df_final["Brecha_CCL"] = (((df_final["CCL"] / df_final["USD_Oficial"]) - 1) * 100).round(2)
+df_final = df_final.dropna(subset=["SP500"]).round(2)
+
+# Deltas para Resumen
+def get_metrics(df):
+    results = []
+    cols = ["SP500", "Merval", "Oro", "Brent", "BTC", "USD_Blue", "CCL", "Brecha_CCL", "Riesgo_Pais"]
+    for c in cols:
+        if c in df.columns:
+            actual = df[c].iloc[-1]
+            d1 = ((actual / df[c].iloc[-2]) - 1) * 100
+            m1 = ((actual / df[c].iloc[abs(df["fecha"] - (hoy - timedelta(days=30))).idxmin()]) - 1) * 100
+            results.append([c, actual, round(d1,2), round(m1,2)])
+    return pd.DataFrame(results, columns=["Metrica", "Valor_Actual", "Delta_1D_%", "Delta_1M_%"])
+
+df_resumen = get_metrics(df_final)
+
+# ==========================================
+# 4. CARGA A GOOGLE SHEETS
+# ==========================================
+print("📤 Actualizando Google Sheets...")
+def write_ws(sh, name, df):
+    try:
+        ws = sh.worksheet(name)
+    except:
+        ws = sh.add_worksheet(title=name, rows="1000", cols="20")
+    ws.clear()
+    ws.update([df.columns.values.tolist()] + df.astype(str).replace('nan', '').values.tolist())
+    time.sleep(2)
+
+write_ws(sh, "DB_Historico", df_final)
+write_ws(sh, "DB_Resumen", df_resumen)
+
+# ==========================================
+# 5. CEREBRO IA (Gemini)
+# ==========================================
+print("🧠 Generando análisis IA...")
+prompt = f"""
+Sos un analista financiero senior. Hoy es {hoy.strftime('%d/%m/%Y')}.
+Datos clave: S&P 500 {df_final['SP500'].iloc[-1]}, Riesgo País {df_final['Riesgo_Pais'].iloc[-1]}, Brecha {df_final['Brecha_CCL'].iloc[-1]}%.
+Redactá un flash de mercado de 3 párrafos cortos (Global, Local, Clave hoy). Estilo Bloomberg, sin markdown.
+"""
+url_ai = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={GEMINI_API_KEY}"
+try:
+    res = requests.post(url_ai, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=20)
+    texto_ia = res.json()['candidates'][0]['content']['parts'][0]['text']
+    df_ai = pd.DataFrame([["Fecha", "Analisis_LLM"], [hoy.strftime('%d/%m/%Y'), texto_ia]])
+    write_ws(sh, "DB_Insights", df_ai)
+    print("✅ IA Finalizada.")
+except Exception as e:
+    print(f"⚠️ Error en IA: {e}")
+
+print("🏁 Pipeline completado con éxito.")
