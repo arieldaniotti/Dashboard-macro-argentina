@@ -1,9 +1,3 @@
-¡Por supuesto! Para que no tengas que armar rompecabezas, acá tenés el archivo dashboard.py completo, de principio a fin, con toda la lógica financiera de colores, las unidades en puntos (bps/pp) y los bloques de IA y Fear & Greed intactos.
-
-🛠️ Código Completo (dashboard.py)
-Copiá este bloque entero, andá a tu GitHub, borrá todo el contenido de dashboard.py y pegalo:
-
-Python
 import streamlit as st
 import pandas as pd
 import gspread
