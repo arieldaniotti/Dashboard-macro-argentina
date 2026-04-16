@@ -1,118 +1,146 @@
-
 import streamlit as st
 import pandas as pd
 import gspread
-from google.oauth2 import service_account
+from google.oauth2.service_account import Credentials
 import plotly.express as px
-from datetime import datetime
 
-st.set_page_config(
-    page_title="Dashboard Macro Argentina",
-    page_icon="📊",
-    layout="wide"
-)
+# ==========================================
+# 1. CONFIGURACIÓN Y ESTILOS (Look Bloomberg)
+# ==========================================
+st.set_page_config(page_title="Dashboard Macro", layout="wide", initial_sidebar_state="collapsed")
 
-st.title("Dashboard Macro Argentina")
-st.caption(f"Última actualización: {datetime.today().strftime('%d/%m/%Y')}")
+st.markdown("""
+    <style>
+    .stApp { background-color: #07090f; color: #e2e8f0; font-family: sans-serif; }
+    .metric-container { background-color: #0b0e18; border: 1px solid #141928; border-radius: 7px; padding: 15px; text-align: center; }
+    .metric-label { font-size: 11px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.05em; }
+    .metric-value { font-size: 24px; font-weight: 600; color: #f1f5f9; font-family: monospace; }
+    .metric-delta-up { color: #34d399; font-size: 13px; }
+    .metric-delta-down { color: #f87171; font-size: 13px; }
+    .ai-box { background-color: #0a1525; border: 1px solid #1a3050; border-radius: 7px; padding: 20px; margin-bottom: 20px; }
+    .ai-title { color: #38bdf8; font-size: 12px; font-weight: bold; text-transform: uppercase; margin-bottom: 10px; }
+    .ai-text { color: #cbd5e1; font-size: 14px; line-height: 1.6; }
+    </style>
+""", unsafe_allow_html=True)
 
+# ==========================================
+# 2. CONEXIÓN A LA BASE DE DATOS
+# ==========================================
 @st.cache_data(ttl=3600)
-def cargar_datos():
-    credenciales = service_account.Credentials.from_service_account_info(
-        st.secrets["gcp_service_account"],
-        scopes=[
-            "https://spreadsheets.google.com/feeds",
-            "https://www.googleapis.com/auth/drive",
-        ],
-    )
-    gc    = gspread.authorize(credenciales)
-    sh    = gc.open("Dashboard Macro")
-    datos = sh.sheet1.get_all_values()
-    df    = pd.DataFrame(datos[1:], columns=datos[0])
-    for col in df.columns:
-        if col not in ["Fecha", "Hora"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df
+def load_data():
+    scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+    creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scopes)
+    client = gspread.authorize(creds)
+    sh = client.open("Dashboard Macro")
+    
+    # Leemos todas las pestañas
+    df_res = pd.DataFrame(sh.worksheet("DB_Resumen").get_all_records())
+    df_ai = pd.DataFrame(sh.worksheet("DB_Insights").get_all_records())
+    df_macro = pd.DataFrame(sh.worksheet("DB_Macro").get_all_records())
+    df_hist = pd.DataFrame(sh.worksheet("DB_Historico").get_all_records())
+    
+    return df_res, df_ai, df_macro, df_hist
 
-def safe_metric(label, col, df, prefijo="", sufijo="", decimales=2):
+df_resumen, df_insights, df_macro, df_hist = load_data()
+
+# ==========================================
+# 3. INTERFAZ VISUAL Y NAVEGACIÓN
+# ==========================================
+st.title("📊 Dashboard Económico Financiero")
+st.caption("Actualización diaria mediante pipeline automático.")
+
+# Creamos las 5 solapas
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📌 Resumen", "🌎 Macro Global", "🇦🇷 Argentina", "🏗️ Inmobiliario", "💼 Portafolio"])
+
+# Función para tarjetas de métricas
+def render_metric(label, value, delta):
+    color_class = "metric-delta-up" if float(delta) >= 0 else "metric-delta-down"
+    arrow = "▲" if float(delta) >= 0 else "▼"
+    return f"""
+    <div class="metric-container">
+        <div class="metric-label">{label}</div>
+        <div class="metric-value">{value}</div>
+        <div class="{color_class}">{arrow} {abs(float(delta))}%</div>
+    </div>
+    """
+
+def get_val(df, metrica):
     try:
-        ultimo   = float(df.iloc[-1][col])
-        anterior = float(df.iloc[-2][col]) if len(df) > 1 else ultimo
-        delta    = ultimo - anterior
-        if decimales == 0:
-            st.metric(label, f"{prefijo}{ultimo:,.0f}{sufijo}", f"{delta:+,.0f}")
-        else:
-            st.metric(label, f"{prefijo}{ultimo:,.{decimales}f}{sufijo}", f"{delta:+,.{decimales}f}")
+        row = df[df['Metrica'] == metrica]
+        return row['Valor_Actual'].values[0], row['Delta_1D_%'].values[0]
     except:
-        st.metric(label, "N/D", None)
+        return "N/A", 0
 
-df = cargar_datos()
+# ------------------------------------------
+# TAB 1: RESUMEN Y FLASH IA
+# ------------------------------------------
+with tab1:
+    if not df_insights.empty:
+        texto_ia = df_insights['Analisis_LLM'].iloc[-1]
+        st.markdown(f"""
+            <div class="ai-box">
+                <div class="ai-title">🤖 Análisis IA — Flash del Mercado</div>
+                <div class="ai-text">{texto_ia.replace(chr(10), '<br>')}</div>
+            </div>
+        """, unsafe_allow_html=True)
 
-# ---- MERCADOS GLOBALES ----
-st.subheader("Mercados globales")
-c1, c2, c3, c4, c5 = st.columns(5)
-with c1: safe_metric("S&P 500",    "SP500",  df, decimales=0)
-with c2: safe_metric("Nasdaq 100", "Nasdaq", df, decimales=0)
-with c3: safe_metric("Oro",        "Oro",    df, "USD ", decimales=0)
-with c4: safe_metric("Brent",      "Brent",  df, "USD ", decimales=1)
-with c5: safe_metric("Bitcoin",    "BTC",    df, "USD ", decimales=0)
+    st.subheader("Mercados")
+    col1, col2, col3, col4, col5 = st.columns(5)
+    
+    sp_v, sp_d = get_val(df_resumen, 'SP500')
+    oro_v, oro_d = get_val(df_resumen, 'Oro')
+    btc_v, btc_d = get_val(df_resumen, 'BTC')
+    rp_v, rp_d = get_val(df_resumen, 'Riesgo_Pais')
+    brecha_v, brecha_d = get_val(df_resumen, 'Brecha_CCL')
 
-st.divider()
+    with col1: st.markdown(render_metric("S&P 500", f"{sp_v}", sp_d), unsafe_allow_html=True)
+    with col2: st.markdown(render_metric("Oro", f"USD {oro_v}", oro_d), unsafe_allow_html=True)
+    with col3: st.markdown(render_metric("Bitcoin", f"USD {btc_v}", btc_d), unsafe_allow_html=True)
+    with col4: st.markdown(render_metric("Riesgo País", f"{rp_v}", rp_d), unsafe_allow_html=True)
+    with col5: st.markdown(render_metric("Brecha Cambiaria", f"{brecha_v}%", brecha_d), unsafe_allow_html=True)
 
-# ---- ARGENTINA ----
-st.subheader("Argentina — tipos de cambio")
-c1, c2, c3, c4 = st.columns(4)
-with c1: safe_metric("USD Oficial", "USD_Oficial", df, "$ ", decimales=0)
-with c2: safe_metric("USD Blue",    "USD_Blue",    df, "$ ", decimales=0)
-with c3: safe_metric("CCL",         "CCL",         df, "$ ", decimales=0)
-with c4: safe_metric("Brecha CCL",  "Brecha_CCL",  df, sufijo="%", decimales=1)
+# ------------------------------------------
+# TAB 2: MACRO GLOBAL
+# ------------------------------------------
+with tab2:
+    st.subheader("Contexto Internacional y Tasas")
+    col1, col2 = st.columns(2)
+    
+    if not df_macro.empty:
+        with col1:
+            st.markdown("**Evolución Tasa FED vs SELIC (Brasil)**")
+            fig_tasas = px.line(df_macro, x='fecha', y=['FEDFUNDS', 'Tasa_SELIC_Brasil'], 
+                                template='plotly_dark', color_discrete_sequence=['#38bdf8', '#34d399'])
+            fig_tasas.update_layout(legend_title_text='Tasa')
+            st.plotly_chart(fig_tasas, use_container_width=True)
+            
+        with col2:
+            st.markdown("**Yield Curve (10Y - 2Y)**")
+            fig_yield = px.area(df_macro, x='fecha', y='T10Y2Y', template='plotly_dark', color_discrete_sequence=['#f59e0b'])
+            st.plotly_chart(fig_yield, use_container_width=True)
 
-st.divider()
+# ------------------------------------------
+# TAB 3: ARGENTINA
+# ------------------------------------------
+with tab3:
+    st.subheader("Variables Monetarias Locales")
+    if not df_hist.empty:
+        st.markdown("**Dólar Oficial vs Blue vs CCL**")
+        fig_usd = px.line(df_hist, x='fecha', y=['USD_Oficial', 'USD_Blue', 'CCL'], 
+                          template='plotly_dark', color_discrete_sequence=['#94a3b8', '#38bdf8', '#34d399'])
+        fig_usd.update_layout(legend_title_text='Tipo de Cambio')
+        st.plotly_chart(fig_usd, use_container_width=True)
 
-# ---- MACRO USA ----
-st.subheader("Macro USA")
-c1, c2, c3, c4 = st.columns(4)
-with c1: safe_metric("Inflación USA", "Inflacion_USA", df, sufijo="%")
-with c2: safe_metric("Tasa Fed",      "Tasa_Fed",      df, sufijo="%")
-with c3: safe_metric("Tasa real",     "Tasa_Real",     df, sufijo="%")
-with c4: safe_metric("Yield curve",   "Yield_Curve",   df, sufijo="%")
+# ------------------------------------------
+# TAB 4: INMOBILIARIO
+# ------------------------------------------
+with tab4:
+    st.subheader("Mercado Inmobiliario")
+    st.info("💡 Espacio reservado para el módulo de Real Estate. Aquí conectaremos los datos de Costo de Construcción y Valor del M2.")
 
-st.divider()
-
-# ---- GRÁFICOS ----
-st.subheader("Evolución histórica")
-c1, c2 = st.columns(2)
-
-with c1:
-    if "SP500" in df.columns:
-        fig = px.line(df, x="Fecha", y="SP500",
-                      title="S&P 500",
-                      color_discrete_sequence=["#185FA5"])
-        fig.update_layout(showlegend=False, height=300)
-        st.plotly_chart(fig, use_container_width=True)
-
-with c2:
-    cols = [c for c in ["USD_Oficial","USD_Blue","CCL"] if c in df.columns]
-    if cols:
-        fig = px.line(df, x="Fecha", y=cols,
-                      title="Tipos de cambio ARS",
-                      color_discrete_sequence=["#185FA5","#E24B4A","#639922"])
-        fig.update_layout(height=300)
-        st.plotly_chart(fig, use_container_width=True)
-
-st.divider()
-
-# ---- PORTAFOLIO ----
-st.subheader("Portafolio — precios ADR (USD)")
-activos = ["MELI","NVDA","MSFT","GOOGL","YPF","VIST","PAM","GGAL"]
-precios = []
-for a in activos:
-    try:
-        precios.append(round(float(df.iloc[-1][a]), 2))
-    except:
-        precios.append(None)
-
-st.dataframe(
-    pd.DataFrame({"Activo": activos, "Precio USD": precios}),
-    use_container_width=True,
-    hide_index=True
-)
+# ------------------------------------------
+# TAB 5: PORTAFOLIO
+# ------------------------------------------
+with tab5:
+    st.subheader("Portafolio de Inversión")
+    st.info("💡 Espacio reservado para Asset Allocation, TIR y métricas de riesgo personalizadas.")
