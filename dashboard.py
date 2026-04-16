@@ -24,7 +24,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 2. CONEXIÓN A LA BASE DE DATOS
+# 2. CONEXIÓN A LA BASE DE DATOS (VERSIÓN ROBUSTA)
 # ==========================================
 @st.cache_data(ttl=3600)
 def load_data():
@@ -33,11 +33,23 @@ def load_data():
     client = gspread.authorize(creds)
     sh = client.open("Dashboard Macro")
     
-    # Leemos todas las pestañas
-    df_res = pd.DataFrame(sh.worksheet("DB_Resumen").get_all_records())
-    df_ai = pd.DataFrame(sh.worksheet("DB_Insights").get_all_records())
-    df_macro = pd.DataFrame(sh.worksheet("DB_Macro").get_all_records())
-    df_hist = pd.DataFrame(sh.worksheet("DB_Historico").get_all_records())
+    # Función auxiliar para lectura segura (evita crashes por columnas vacías)
+    def safe_read(sheet_name):
+        try:
+            ws = sh.worksheet(sheet_name)
+            data = ws.get_all_values()
+            if len(data) > 1:
+                return pd.DataFrame(data[1:], columns=data[0])
+            return pd.DataFrame()
+        except Exception as e:
+            st.error(f"Error leyendo {sheet_name}: {e}")
+            return pd.DataFrame()
+
+    # Leemos todas las pestañas de forma segura
+    df_res = safe_read("DB_Resumen")
+    df_ai = safe_read("DB_Insights")
+    df_macro = safe_read("DB_Macro")
+    df_hist = safe_read("DB_Historico")
     
     return df_res, df_ai, df_macro, df_hist
 
