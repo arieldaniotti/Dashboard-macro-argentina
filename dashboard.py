@@ -83,31 +83,41 @@ st.title("📊 Dashboard Económico Financiero")
 st.caption("Actualización diaria automática. Diseño y analítica propietaria.")
 
 # Función maestra que extrae el valor actual, delta diario y delta mensual desde la historia bruta
+# Función maestra que extrae el valor actual, delta diario y mensual
 def get_kpi(col_name):
     try:
-        df = df_hist.dropna(subset=[col_name]).sort_values('fecha')
+        # Verificamos que la columna exista
+        if col_name not in df_hist.columns: return "N/A", 0, 0
+        
+        # Aislamos las columnas que necesitamos
+        df = df_hist[['fecha', col_name]].copy()
+        
+        # Convertimos texto a número y ELIMINAMOS las filas fantasmas/vacías
+        df[col_name] = pd.to_numeric(df[col_name], errors='coerce')
+        df = df.dropna(subset=['fecha', col_name]).sort_values('fecha')
+        
         if df.empty: return "N/A", 0, 0
         
-        # Convertir a números para poder operar
-        df[col_name] = pd.to_numeric(df[col_name], errors='coerce')
-        
+        # Último valor y día anterior
         actual = df[col_name].iloc[-1]
         d1 = df[col_name].iloc[-2] if len(df)>1 else actual
         
-        # Valor de hace 1 mes (30 días aprox)
+        # Valor de hace 1 mes cronológico
         hace_1m = df['fecha'].iloc[-1] - pd.Timedelta(days=30)
         idx_1m = (df['fecha'] - hace_1m).abs().idxmin()
         m1 = df.loc[idx_1m, col_name]
         
-        d1_pct = ((actual/d1)-1)*100 if d1 else 0
-        m1_pct = ((actual/m1)-1)*100 if m1 else 0
+        # Porcentajes
+        d1_pct = ((actual/d1)-1)*100 if d1 and d1 != 0 else 0
+        m1_pct = ((actual/m1)-1)*100 if m1 and m1 != 0 else 0
         
-        # Formateo
+        # Formateo (ej. 1234.56 -> 1.234,56)
         val_str = f"{actual:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
         if val_str.endswith(",00"): val_str = val_str[:-3]
         
         return val_str, d1_pct, m1_pct
-    except: return "N/A", 0, 0
+    except Exception as e: 
+        return "N/A", 0, 0
 
 # Función HTML para dibujar la tarjeta
 def render_card(title, val, d1, d1m, prefix="", suffix=""):
