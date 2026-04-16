@@ -1,31 +1,31 @@
-name: Pipeline macro v2
+name: Pipeline Limpio V2
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: '0 11 * * 1-5'
+    - cron: '0 10 * * 1-5' # Se ejecuta automático de lunes a viernes
+  workflow_dispatch: # Botón manual para forzar la ejecución
 
 jobs:
   ejecutar:
     runs-on: ubuntu-latest
+    
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
+      - name: Descargar repositorio
+        uses: actions/checkout@v3
+        
+      - name: Configurar Python
+        uses: actions/setup-python@v4
         with:
-          python-version: '3.11'
-          cache: ''
-
-      - name: Instalar
-        run: pip install --no-cache-dir yfinance requests gspread google-auth pandas
-
-      - name: Ver archivo
-        run: cat pipeline_v2.py | head -10
-
-      - name: Credenciales
-        run: echo '${{ secrets.GCLOUD_SERVICE_ACCOUNT }}' > credentials.json
-
-      - name: Correr
-        run: python pipeline_v2.py
+          python-version: '3.10'
+          
+      - name: Instalar librerías
+        run: pip install -r requirements.txt
+        
+      - name: Ejecutar motor de datos
         env:
-          SHEET_NAME: ${{ secrets.SHEET_NAME }}
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+          CHILE_USER: ${{ secrets.CHILE_USER }}
+          CHILE_PASS: ${{ secrets.CHILE_PASS }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GCLOUD_SERVICE_ACCOUNT: ${{ secrets.GCLOUD_SERVICE_ACCOUNT }}
+        run: python pipeline_v2.py
