@@ -24,7 +24,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 2. CONEXIÓN A LA BASE DE DATOS (SEGURA)
+# 2. CONEXIÓN A LA BASE DE DATOS (SEGURA Y FILTRADA)
 # ==========================================
 @st.cache_data(ttl=3600)
 def load_data():
@@ -33,14 +33,21 @@ def load_data():
     client = gspread.authorize(creds)
     sh = client.open("Dashboard Macro")
     
-    # Lectura cruda para evitar errores de formato en Sheets
+    # Lectura a prueba de balas (Filtra columnas fantasma)
     def safe_read(sheet_name):
         try:
             ws = sh.worksheet(sheet_name)
             data = ws.get_all_values()
-            if len(data) > 1: return pd.DataFrame(data[1:], columns=data[0])
+            if len(data) > 1:
+                df = pd.DataFrame(data[1:], columns=data[0])
+                # MAGIA ACÁ: Eliminamos columnas sin nombre ('') y duplicadas
+                df = df.loc[:, df.columns != '']
+                df = df.loc[:, ~df.columns.duplicated()]
+                return df
             return pd.DataFrame()
-        except: return pd.DataFrame()
+        except Exception as e:
+            st.error(f"Error en {sheet_name}: {e}")
+            return pd.DataFrame()
 
     df_res = safe_read("DB_Resumen")
     df_ai = safe_read("DB_Insights")
