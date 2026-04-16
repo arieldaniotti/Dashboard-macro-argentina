@@ -1,3 +1,9 @@
+¡Por supuesto! Para que no tengas que armar rompecabezas, acá tenés el archivo dashboard.py completo, de principio a fin, con toda la lógica financiera de colores, las unidades en puntos (bps/pp) y los bloques de IA y Fear & Greed intactos.
+
+🛠️ Código Completo (dashboard.py)
+Copiá este bloque entero, andá a tu GitHub, borrá todo el contenido de dashboard.py y pegalo:
+
+Python
 import streamlit as st
 import pandas as pd
 import gspread
@@ -14,18 +20,25 @@ st.markdown("""
     <style>
     .stApp { background-color: #07090f; color: #e2e8f0; font-family: sans-serif; }
     
-    /* Nuevas Tarjetas de Resumen */
+    /* Tarjetas de Resumen */
     .metric-card { background-color: #0b0e18; border: 1px solid #1e293b; border-radius: 8px; padding: 20px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); }
     .m-title { font-size: 16px; color: #cbd5e1; font-weight: 800; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 10px; }
     .m-val { font-size: 28px; color: #f8fafc; font-weight: 700; font-family: 'Courier New', monospace; margin-bottom: 15px; }
+    
+    /* Porcentajes y variaciones */
     .m-deltas { display: flex; justify-content: space-between; font-size: 18px; font-weight: 800; padding-top: 12px; border-top: 1px solid #1e293b; }
-    .d-up { color: #10b981; } /* Verde Esmeralda */
-    .d-down { color: #ef4444; } /* Rojo */
-    .d-flat { color: #64748b; } /* Gris */
+    
+    /* Lógica de colores financieros */
+    .d-up-good { color: #10b981; }   /* Verde: Sube activo normal (ej. S&P) */
+    .d-down-bad { color: #ef4444; }  /* Rojo: Baja activo normal (ej. S&P) */
+    .d-up-bad { color: #ef4444; }    /* Rojo: Sube riesgo (ej. Riesgo País, Brecha) */
+    .d-down-good { color: #10b981; } /* Verde: Baja riesgo (ej. Riesgo País, Brecha) */
+    .d-flat { color: #64748b; }      /* Gris: Sin cambios */
+    
     .d-label { color: #64748b; font-size: 13px; margin-right: 8px; font-weight: 600; }
     
-    /* Caja de Inteligencia Artificial */
-    .ai-box { background-color: #0a1525; border: 1px solid #1a3050; border-radius: 8px; padding: 24px; margin-top: 30px; }
+    /* Caja IA */
+    .ai-box { background-color: #0a1525; border: 1px solid #1a3050; border-radius: 8px; padding: 24px; height: 100%; margin-top: 0; }
     .ai-title { color: #38bdf8; font-size: 13px; font-weight: bold; text-transform: uppercase; margin-bottom: 15px; display: flex; align-items: center; gap: 8px;}
     .ai-text { color: #cbd5e1; font-size: 15px; line-height: 1.7; }
     </style>
@@ -34,7 +47,7 @@ st.markdown("""
 # ==========================================
 # 2. CONEXIÓN A LA BASE DE DATOS Y APIS
 # ==========================================
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=600)
 def load_data():
     scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
     creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scopes)
@@ -49,6 +62,12 @@ def load_data():
                 df = pd.DataFrame(data[1:], columns=data[0])
                 df = df.loc[:, df.columns != '']
                 df = df.loc[:, ~df.columns.duplicated()]
+                
+                # Formateo de fechas y eliminación de duplicados para cálculos limpios
+                if 'fecha' in df.columns:
+                    df['fecha'] = pd.to_datetime(df['fecha'], errors='coerce', format='mixed', dayfirst=True)
+                    df = df.dropna(subset=['fecha']).drop_duplicates(subset=['fecha'], keep='last').sort_values('fecha')
+                
                 return df
             return pd.DataFrame()
         except: return pd.DataFrame()
@@ -56,11 +75,6 @@ def load_data():
     df_ai = safe_read("DB_Insights")
     df_macro = safe_read("DB_Macro")
     df_hist = safe_read("DB_Historico")
-    
-    if not df_macro.empty and 'fecha' in df_macro.columns:
-        df_macro['fecha'] = pd.to_datetime(df_macro['fecha'], format='%d/%m/%Y', errors='coerce')
-    if not df_hist.empty and 'fecha' in df_hist.columns:
-        df_hist['fecha'] = pd.to_datetime(df_hist['fecha'], errors='coerce')
         
     return df_ai, df_macro, df_hist
 
@@ -76,57 +90,77 @@ def get_fear_and_greed():
 fng_val, fng_class = get_fear_and_greed()
 
 # ==========================================
-# 3. FUNCIONES DE CÁLCULO Y RENDERIZADO VISUAL
+# 3. LÓGICA FINANCIERA DE VARIACIONES
 # ==========================================
 st.title("📊 Dashboard Económico Financiero")
 st.caption("Actualización diaria automática. Diseño y analítica propietaria.")
 
-def get_kpi(col_name):
+def get_kpi_advanced(col_name):
     try:
-        if col_name not in df_hist.columns: return "N/A", 0, 0
+        if col_name not in df_hist.columns: return "N/A", 0, 0, False
+        
         df = df_hist[['fecha', col_name]].copy()
         df[col_name] = pd.to_numeric(df[col_name], errors='coerce')
-        df = df.dropna(subset=['fecha', col_name]).sort_values('fecha')
-        if df.empty: return "N/A", 0, 0
+        df = df.dropna(subset=[col_name]).sort_values('fecha')
+        
+        if df.empty: return "N/A", 0, 0, False
         
         actual = df[col_name].iloc[-1]
-        d1 = df[col_name].iloc[-2] if len(df)>1 else actual
+        prev_1d = df[col_name].iloc[-2] if len(df) > 1 else actual
         
         hace_1m = df['fecha'].iloc[-1] - pd.Timedelta(days=30)
-        idx_1m = (df['fecha'] - hace_1m).abs().idxmin()
-        m1 = df.loc[idx_1m, col_name]
+        m1_val = df.loc[(df['fecha'] - hace_1m).abs().idxmin(), col_name]
+
+        # Identificamos si es una métrica en puntos (donde suba = malo)
+        is_points = col_name in ['Riesgo_Pais', 'Brecha_CCL']
         
-        d1_pct = ((actual/d1)-1)*100 if d1 and d1 != 0 else 0
-        m1_pct = ((actual/m1)-1)*100 if m1 and m1 != 0 else 0
-        
+        if is_points:
+            d1_delta = actual - prev_1d
+            m1_delta = actual - m1_val
+        else:
+            d1_delta = ((actual / prev_1d) - 1) * 100 if prev_1d else 0
+            m1_delta = ((actual / m1_val) - 1) * 100 if m1_val else 0
+            
         val_str = f"{actual:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
         if val_str.endswith(",00"): val_str = val_str[:-3]
         
-        return val_str, d1_pct, m1_pct
+        return val_str, d1_delta, m1_delta, is_points
     except Exception as e: 
-        return "N/A", 0, 0
+        return "N/A", 0, 0, False
 
-def render_card(title, val, d1, d1m, prefix="", suffix=""):
-    def f_delta(v):
-        try:
-            if v > 0: return f"▲ {v:.2f}%", "d-up"
-            if v < 0: return f"▼ {abs(v):.2f}%", "d-down"
-            return "▬ 0.00%", "d-flat"
-        except: return "N/A", "d-flat"
+def render_card_advanced(title, col_name, prefix="", suffix=""):
+    val, d1, m1, is_points = get_kpi_advanced(col_name)
     
-    d1_s, d1_c = f_delta(d1)
-    d1m_s, d1m_c = f_delta(d1m)
+    inverted = col_name in ['Riesgo_Pais', 'Brecha_CCL']
     
-    return f"""
+    def get_style(delta, is_inv):
+        if val == "N/A": return "N/A", "d-flat"
+        if abs(delta) < 0.005: return "▬ 0.00", "d-flat"
+        
+        symbol = "▲" if delta > 0 else "▼"
+        # Mostramos 'pp' para brecha, 'bps' para riesgo país, '%' para el resto
+        label = f"{abs(delta):.2f}" + (" pp" if (is_points and col_name == 'Brecha_CCL') else " bps" if is_points else "%")
+        
+        if is_inv:
+            color = "d-up-bad" if delta > 0 else "d-down-good"
+        else:
+            color = "d-up-good" if delta > 0 else "d-down-bad"
+            
+        return f"{symbol} {label}", color
+
+    d1_label, d1_class = get_style(d1, inverted)
+    m1_label, m1_class = get_style(m1, inverted)
+
+    st.markdown(f"""
     <div class="metric-card">
         <div class="m-title">{title}</div>
         <div class="m-val">{prefix}{val}{suffix}</div>
         <div class="m-deltas">
-            <span><span class="d-label">1D</span><span class="{d1_c}">{d1_s}</span></span>
-            <span><span class="d-label">1M</span><span class="{d1m_c}">{d1m_s}</span></span>
+            <span><span class="d-label">1D</span><span class="{d1_class}">{d1_label}</span></span>
+            <span><span class="d-label">1M</span><span class="{m1_class}">{m1_label}</span></span>
         </div>
     </div>
-    """
+    """, unsafe_allow_html=True)
 
 def aplicar_estilo_bloomberg(fig):
     fig.update_layout(
@@ -142,30 +176,23 @@ def aplicar_estilo_bloomberg(fig):
 # ==========================================
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["📌 Resumen", "🌎 Macro Global", "🇦🇷 Argentina", "🏗️ Inmobiliario", "💼 Portafolio"])
 
+# --- TAB 1: RESUMEN ---
 with tab1:
     st.subheader("Panorama de Mercado")
-    sp_v, sp_d1, sp_d1m = get_kpi('SP500')
-    merv_v, merv_d1, merv_d1m = get_kpi('Merval')
-    ofi_v, ofi_d1, ofi_d1m = get_kpi('USD_Oficial')
-    oro_v, oro_d1, oro_d1m = get_kpi('Oro')
-    brent_v, brent_d1, brent_d1m = get_kpi('Brent')
-    btc_v, btc_d1, btc_d1m = get_kpi('BTC')
-    rp_v, rp_d1, rp_d1m = get_kpi('Riesgo_Pais')
-    brecha_v, brecha_d1, brecha_d1m = get_kpi('Brecha_CCL')
-
-    col1, col2, col3, col4 = st.columns(4)
-    with col1: st.markdown(render_card("S&P 500", sp_v, sp_d1, sp_d1m), unsafe_allow_html=True)
-    with col2: st.markdown(render_card("Merval", merv_v, merv_d1, merv_d1m), unsafe_allow_html=True)
-    with col3: st.markdown(render_card("Oro", oro_v, oro_d1, oro_d1m, prefix="USD "), unsafe_allow_html=True)
-    with col4: st.markdown(render_card("Brent", brent_v, brent_d1, brent_d1m, prefix="USD "), unsafe_allow_html=True)
+    
+    c1, c2, c3, c4 = st.columns(4)
+    with c1: render_card_advanced("S&P 500", "SP500")
+    with c2: render_card_advanced("Merval", "Merval")
+    with c3: render_card_advanced("Oro", "Oro", prefix="USD ")
+    with c4: render_card_advanced("Brent", "Brent", prefix="USD ")
     
     st.markdown("<br>", unsafe_allow_html=True)
     
-    col5, col6, col7, col8 = st.columns(4)
-    with col5: st.markdown(render_card("Dólar Oficial", ofi_v, ofi_d1, ofi_d1m, prefix="$"), unsafe_allow_html=True)
-    with col6: st.markdown(render_card("Riesgo País", rp_v, rp_d1, rp_d1m, suffix=" bps"), unsafe_allow_html=True)
-    with col7: st.markdown(render_card("Brecha CCL", brecha_v, brecha_d1, brecha_d1m, suffix="%"), unsafe_allow_html=True)
-    with col8: st.markdown(render_card("Bitcoin", btc_v, btc_d1, btc_d1m, prefix="USD "), unsafe_allow_html=True)
+    c5, c6, c7, c8 = st.columns(4)
+    with c5: render_card_advanced("Dólar Oficial", "USD_Oficial", prefix="$")
+    with c6: render_card_advanced("Riesgo País", "Riesgo_Pais", suffix=" bps")
+    with c7: render_card_advanced("Brecha CCL", "Brecha_CCL", suffix="%")
+    with c8: render_card_advanced("Bitcoin", "BTC", prefix="USD ")
 
     st.markdown("<br>", unsafe_allow_html=True)
     col_fg, col_ia = st.columns([1, 3])
@@ -173,7 +200,7 @@ with tab1:
     with col_fg:
         color_fg = "#ef4444" if "Fear" in fng_class else "#10b981" if "Greed" in fng_class else "#f59e0b"
         st.markdown(f"""
-        <div class="metric-card" style="text-align: center; height: 100%; display: flex; flex-direction: column; justify-content: center;">
+        <div class="metric-card" style="text-align: center; height: 100%; display: flex; flex-direction: column; justify-content: center; padding: 24px;">
             <div class="m-title" style="margin-bottom: 15px;">Índice Miedo y Codicia</div>
             <div class="m-val" style="font-size: 38px; color: {color_fg};">{fng_val}</div>
             <div style="color: {color_fg}; font-weight: bold; font-size: 14px;">{fng_class.upper()}</div>
@@ -182,14 +209,15 @@ with tab1:
 
     with col_ia:
         if not df_insights.empty:
-            texto_ia = df_insights['Analisis_LLM'].iloc[-1].replace(chr(10), '<br>')
+            texto_ia = str(df_insights['Analisis_LLM'].iloc[-1]).replace(chr(10), '<br>')
             st.markdown(f"""
-                <div class="ai-box" style="margin-top: 0; height: 100%;">
+                <div class="ai-box">
                     <div class="ai-title">🤖 Insight IA — Análisis de Cierre</div>
                     <div class="ai-text">{texto_ia}</div>
                 </div>
             """, unsafe_allow_html=True)
 
+# --- TAB 2: MACRO GLOBAL ---
 with tab2:
     st.subheader("Contexto Internacional y Tasas")
     col1, col2 = st.columns(2)
@@ -212,6 +240,7 @@ with tab2:
                 st.plotly_chart(aplicar_estilo_bloomberg(fig_yield), use_container_width=True)
             else: st.info("Datos no disponibles.")
 
+# --- TAB 3: ARGENTINA ---
 with tab3:
     st.subheader("Variables Monetarias Locales")
     if not df_hist.empty:
@@ -223,10 +252,12 @@ with tab3:
             st.plotly_chart(aplicar_estilo_bloomberg(fig_usd), use_container_width=True)
         else: st.info("Datos no disponibles.")
 
+# --- TAB 4: INMOBILIARIO ---
 with tab4:
     st.subheader("Mercado Inmobiliario")
     st.info("💡 Espacio reservado para el módulo de Real Estate.")
 
+# --- TAB 5: PORTAFOLIO ---
 with tab5:
     st.subheader("Portafolio de Inversión")
     st.info("💡 Espacio reservado para Asset Allocation.")
