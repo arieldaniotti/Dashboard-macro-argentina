@@ -37,56 +37,36 @@ hace_1a      = hoy - timedelta(days=365)
 fecha_inicio = hace_1a.strftime("%Y-%m-%d")
 
 # ==========================================
-# 2. FUNCIONES DE EXTRACCIÓN
+# 2. CONEXIÓN A LA BASE DE DATOS (VERSIÓN ROBUSTA)
 # ==========================================
-def fetch_api_data(url):
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        res = requests.get(url, headers=headers, timeout=20)
-        res.raise_for_status()
-        return res.json()
-    except Exception as e:
-        print(f"⚠️ Error en API {url.split('/')[2]}: {e}")
-        return []
+@st.cache_data(ttl=3600)
+def load_data():
+    scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+    creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scopes)
+    client = gspread.authorize(creds)
+    sh = client.open("Dashboard Macro")
+    
+    # Función auxiliar para lectura segura (evita crashes por columnas vacías)
+    def safe_read(sheet_name):
+        try:
+            ws = sh.worksheet(sheet_name)
+            data = ws.get_all_values()
+            if len(data) > 1:
+                return pd.DataFrame(data[1:], columns=data[0])
+            return pd.DataFrame()
+        except Exception as e:
+            st.error(f"Error leyendo {sheet_name}: {e}")
+            return pd.DataFrame()
 
-def get_fred_series(series_id, api_key, start_date):
-    url = f"https://api.stlouisfed.org/fred/series/observations?series_id={series_id}&api_key={api_key}&file_type=json&observation_start={start_date}"
-    data = fetch_api_data(url)
-    if data and 'observations' in data:
-        df = pd.DataFrame(data['observations'])[['date', 'value']]
-        df = df[df['value'] != '.'].copy()
-        df['value'] = df['value'].astype(float)
-        df['date'] = pd.to_datetime(df['date'])
-        df.rename(columns={'date': 'fecha', 'value': series_id}, inplace=True)
-        return df
-    return pd.DataFrame(columns=['fecha', series_id])
+    # Leemos todas las pestañas de forma segura
+    df_res = safe_read("DB_Resumen")
+    df_ai = safe_read("DB_Insights")
+    df_macro = safe_read("DB_Macro")
+    df_hist = safe_read("DB_Historico")
+    
+    return df_res, df_ai, df_macro, df_hist
 
-def get_bcb_data(serie_id, nombre_columna):
-    url = f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{serie_id}/dados?formato=json"
-    try:
-        res = requests.get(url, timeout=20) 
-        res.raise_for_status()
-        df = pd.DataFrame(res.json())
-        df['data'] = pd.to_datetime(df['data'], format='%d/%m/%Y')
-        df['valor'] = df['valor'].astype(float)
-        return df.rename(columns={'data': 'fecha', 'valor': nombre_columna})
-    except:
-        return pd.DataFrame(columns=['fecha', nombre_columna])
-
-def get_chile_data(series_id, nombre_columna, user, password, start_date):
-    url = f"https://si3.bcentral.cl/SieteRestWS/SieteRestWS.ashx?user={user}&pass={password}&firstdate={start_date}&timeseries={series_id}&function=GetSeries"
-    try:
-        data = fetch_api_data(url)
-        if data and data.get("CodigoError") == 0:
-            obs = data.get("Series", {}).get("Obs", [])
-            if obs:
-                df = pd.DataFrame(obs)
-                df['fecha'] = pd.to_datetime(df['indexDateString'], format='%d-%m-%Y')
-                df['valor'] = pd.to_numeric(df['value'], errors='coerce')
-                return df[['fecha', 'valor']].rename(columns={'valor': nombre_columna})
-    except:
-        pass
-    return pd.DataFrame(columns=['fecha', nombre_columna])
+df_resumen, df_insights, df_macro, df_hist = load_data()
 
 # ==========================================
 # 3. PROCESO DE DATOS
