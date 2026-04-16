@@ -24,7 +24,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 2. CONEXIÓN A LA BASE DE DATOS (SEGURA Y FILTRADA)
+# 2. CONEXIÓN A LA BASE DE DATOS Y LIMPIEZA
 # ==========================================
 @st.cache_data(ttl=3600)
 def load_data():
@@ -33,27 +33,30 @@ def load_data():
     client = gspread.authorize(creds)
     sh = client.open("Dashboard Macro")
     
-    # Lectura a prueba de balas (Filtra columnas fantasma)
     def safe_read(sheet_name):
         try:
             ws = sh.worksheet(sheet_name)
             data = ws.get_all_values()
             if len(data) > 1:
                 df = pd.DataFrame(data[1:], columns=data[0])
-                # MAGIA ACÁ: Eliminamos columnas sin nombre ('') y duplicadas
                 df = df.loc[:, df.columns != '']
                 df = df.loc[:, ~df.columns.duplicated()]
                 return df
             return pd.DataFrame()
-        except Exception as e:
-            st.error(f"Error en {sheet_name}: {e}")
-            return pd.DataFrame()
+        except: return pd.DataFrame()
 
     df_res = safe_read("DB_Resumen")
     df_ai = safe_read("DB_Insights")
     df_macro = safe_read("DB_Macro")
     df_hist = safe_read("DB_Historico")
     
+    # 🌟 PULIDO: Convertimos explícitamente la columna fecha a formato "DateTime" 
+    # para que Plotly dibuje el eje X de forma inteligente y no amontone las letras.
+    if not df_macro.empty and 'fecha' in df_macro.columns:
+        df_macro['fecha'] = pd.to_datetime(df_macro['fecha'], format='%d/%m/%Y', errors='coerce')
+    if not df_hist.empty and 'fecha' in df_hist.columns:
+        df_hist['fecha'] = pd.to_datetime(df_hist['fecha'], errors='coerce')
+        
     return df_res, df_ai, df_macro, df_hist
 
 df_resumen, df_insights, df_macro, df_hist = load_data()
@@ -80,8 +83,26 @@ def render_metric(label, value, delta):
 def get_val(df, metrica):
     try:
         row = df[df['Metrica'] == metrica]
-        return row['Valor_Actual'].values[0], row['Delta_1D_%'].values[0]
+        # Formateo de números grandes (agregamos coma de miles)
+        val = float(row['Valor_Actual'].values[0])
+        val_str = f"{val:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        # Limpieza para que si es 528.0 bps, quede bien
+        if val_str.endswith(",00"): val_str = val_str[:-3]
+        return val_str, row['Delta_1D_%'].values[0]
     except: return "N/A", 0
+
+# 🌟 PULIDO: Función maestra para tunear todos los gráficos iguales
+def aplicar_estilo_bloomberg(fig):
+    fig.update_layout(
+        xaxis_title="", # Saca la palabra "fecha"
+        yaxis_title="", # Saca la palabra "value"
+        legend_title="", # Saca la palabra "variable"
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1), # Leyenda arriba horizontal
+        margin=dict(l=0, r=0, t=30, b=0), # Quita márgenes muertos
+        hovermode="x unified" # Línea vertical interactiva al pasar el mouse
+    )
+    fig.update_traces(line=dict(width=2.5)) # Hace las líneas más gruesas
+    return fig
 
 # --- TAB 1: RESUMEN ---
 with tab1:
@@ -101,7 +122,7 @@ with tab1:
     with col1: st.markdown(render_metric("S&P 500", f"{sp_v}", sp_d), unsafe_allow_html=True)
     with col2: st.markdown(render_metric("Oro", f"USD {oro_v}", oro_d), unsafe_allow_html=True)
     with col3: st.markdown(render_metric("Bitcoin", f"USD {btc_v}", btc_d), unsafe_allow_html=True)
-    with col4: st.markdown(render_metric("Riesgo País", f"{rp_v}", rp_d), unsafe_allow_html=True)
+    with col4: st.markdown(render_metric("Riesgo País", f"{rp_v} bps", rp_d), unsafe_allow_html=True)
     with col5: st.markdown(render_metric("Brecha Cambiaria", f"{brecha_v}%", brecha_d), unsafe_allow_html=True)
 
 # --- TAB 2: MACRO GLOBAL ---
@@ -115,7 +136,7 @@ with tab2:
             if tasas_cols:
                 for c in tasas_cols: df_macro[c] = pd.to_numeric(df_macro[c], errors='coerce')
                 fig_tasas = px.line(df_macro, x='fecha', y=tasas_cols, template='plotly_dark', color_discrete_sequence=['#38bdf8', '#34d399'])
-                st.plotly_chart(fig_tasas, use_container_width=True)
+                st.plotly_chart(aplicar_estilo_bloomberg(fig_tasas), use_container_width=True)
             else:
                 st.info("Datos de tasas no disponibles temporalmente.")
                 
@@ -124,7 +145,9 @@ with tab2:
             if 'T10Y2Y' in df_macro.columns:
                 df_macro['T10Y2Y'] = pd.to_numeric(df_macro['T10Y2Y'], errors='coerce')
                 fig_yield = px.area(df_macro, x='fecha', y='T10Y2Y', template='plotly_dark', color_discrete_sequence=['#f59e0b'])
-                st.plotly_chart(fig_yield, use_container_width=True)
+                # En gráficos de área rellenamos con opacidad
+                fig_yield.update_traces(fillcolor='rgba(245, 158, 11, 0.2)', line=dict(width=2)) 
+                st.plotly_chart(aplicar_estilo_bloomberg(fig_yield), use_container_width=True)
             else:
                 st.info("Datos de Yield Curve no disponibles temporalmente.")
 
@@ -137,16 +160,16 @@ with tab3:
         if usd_cols:
             for c in usd_cols: df_hist[c] = pd.to_numeric(df_hist[c], errors='coerce')
             fig_usd = px.line(df_hist, x='fecha', y=usd_cols, template='plotly_dark', color_discrete_sequence=['#94a3b8', '#38bdf8', '#34d399'])
-            st.plotly_chart(fig_usd, use_container_width=True)
+            st.plotly_chart(aplicar_estilo_bloomberg(fig_usd), use_container_width=True)
         else:
             st.info("Datos de dólares no disponibles temporalmente.")
 
 # --- TAB 4: INMOBILIARIO ---
 with tab4:
     st.subheader("Mercado Inmobiliario")
-    st.info("💡 Espacio reservado para el módulo de Real Estate.")
+    st.info("💡 Espacio reservado para el módulo de Real Estate. Aquí cruzaremos costo de construcción vs M2.")
 
 # --- TAB 5: PORTAFOLIO ---
 with tab5:
     st.subheader("Portafolio de Inversión")
-    st.info("💡 Espacio reservado para Asset Allocation.")
+    st.info("💡 Espacio reservado para Asset Allocation y seguimiento de cartera personal.")
