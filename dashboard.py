@@ -14,24 +14,20 @@ st.markdown("""
     <style>
     .stApp { background-color: #07090f; color: #e2e8f0; font-family: sans-serif; }
     
-    /* Tarjetas de Resumen */
     .metric-card { background-color: #0b0e18; border: 1px solid #1e293b; border-radius: 8px; padding: 20px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); }
     .m-title { font-size: 16px; color: #cbd5e1; font-weight: 800; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 10px; }
     .m-val { font-size: 28px; color: #f8fafc; font-weight: 700; font-family: 'Courier New', monospace; margin-bottom: 15px; }
     
-    /* Porcentajes y variaciones */
     .m-deltas { display: flex; justify-content: space-between; font-size: 18px; font-weight: 800; padding-top: 12px; border-top: 1px solid #1e293b; }
     
-    /* Lógica de colores financieros */
-    .d-up-good { color: #10b981; }   /* Verde: Sube activo normal (ej. S&P) */
-    .d-down-bad { color: #ef4444; }  /* Rojo: Baja activo normal (ej. S&P) */
-    .d-up-bad { color: #ef4444; }    /* Rojo: Sube riesgo (ej. Riesgo País, Brecha) */
-    .d-down-good { color: #10b981; } /* Verde: Baja riesgo (ej. Riesgo País, Brecha) */
-    .d-flat { color: #64748b; }      /* Gris: Sin cambios */
+    .d-up-good { color: #10b981; }   
+    .d-down-bad { color: #ef4444; }  
+    .d-up-bad { color: #ef4444; }    
+    .d-down-good { color: #10b981; } 
+    .d-flat { color: #64748b; }      
     
     .d-label { color: #64748b; font-size: 13px; margin-right: 8px; font-weight: 600; }
     
-    /* Caja IA */
     .ai-box { background-color: #0a1525; border: 1px solid #1a3050; border-radius: 8px; padding: 24px; height: 100%; margin-top: 0; }
     .ai-title { color: #38bdf8; font-size: 13px; font-weight: bold; text-transform: uppercase; margin-bottom: 15px; display: flex; align-items: center; gap: 8px;}
     .ai-text { color: #cbd5e1; font-size: 15px; line-height: 1.7; }
@@ -39,10 +35,10 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 2. CONEXIÓN A LA BASE DE DATOS Y APIS
+# 2. CONEXIÓN A LA BASE DE DATOS (NUEVA FUNCIÓN P/ EVITAR CACHÉ)
 # ==========================================
 @st.cache_data(ttl=600)
-def load_data():
+def fetch_database_data_v2(): # <-- EL CAMBIO DE NOMBRE DESTRUYE EL CACHÉ VIEJO
     scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
     creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scopes)
     client = gspread.authorize(creds)
@@ -58,20 +54,17 @@ def load_data():
                 df = df.loc[:, ~df.columns.duplicated()]
                 
                 if 'fecha' in df.columns:
-                    df['fecha'] = pd.to_datetime(df['fecha'], errors='coerce', format='mixed', dayfirst=True)
+                    # Parseo de fechas clásico y seguro
+                    df['fecha'] = pd.to_datetime(df['fecha'], errors='coerce')
                     df = df.dropna(subset=['fecha']).drop_duplicates(subset=['fecha'], keep='last').sort_values('fecha')
                 
                 return df
             return pd.DataFrame()
         except: return pd.DataFrame()
 
-    df_ai = safe_read("DB_Insights")
-    df_macro = safe_read("DB_Macro")
-    df_hist = safe_read("DB_Historico")
-        
-    return df_ai, df_macro, df_hist
+    return safe_read("DB_Insights"), safe_read("DB_Macro"), safe_read("DB_Historico")
 
-df_insights, df_macro, df_hist = load_data()
+df_insights, df_macro, df_hist = fetch_database_data_v2()
 
 @st.cache_data(ttl=3600)
 def get_fear_and_greed():
@@ -101,14 +94,13 @@ def get_kpi_advanced(col_name):
         actual = df[col_name].iloc[-1]
         prev_1d = df[col_name].iloc[-2] if len(df) > 1 else actual
         
-        # 🌟 CÁLCULO SEGURO DEL MES ANTERIOR (A PRUEBA DE FALLOS)
         hace_1m = df['fecha'].iloc[-1] - pd.Timedelta(days=30)
         df_m1 = df[df['fecha'] <= hace_1m]
         
         if not df_m1.empty:
-            m1_val = df_m1.iloc[-1][col_name] # Toma el valor más reciente que sea <= a 30 días atrás
+            m1_val = df_m1.iloc[-1][col_name] 
         else:
-            m1_val = df[col_name].iloc[0] # Si la base de datos tiene menos de un mes, toma el dato más viejo
+            m1_val = df[col_name].iloc[0] 
             
         is_points = col_name in ['Riesgo_Pais', 'Brecha_CCL']
         
@@ -128,7 +120,6 @@ def get_kpi_advanced(col_name):
 
 def render_card_advanced(title, col_name, prefix="", suffix=""):
     val, d1, m1, is_points = get_kpi_advanced(col_name)
-    
     inverted = col_name in ['Riesgo_Pais', 'Brecha_CCL']
     
     def get_style(delta, is_inv):
@@ -136,7 +127,6 @@ def render_card_advanced(title, col_name, prefix="", suffix=""):
         
         unidad = " pp" if (is_points and col_name == 'Brecha_CCL') else " bps" if is_points else "%"
         
-        # Tolerancia estricta a cero para evitar el -0.00
         if abs(delta) < 0.005: 
             return f"▬ 0.00{unidad}", "d-flat"
         
@@ -180,7 +170,6 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs(["📌 Resumen", "🌎 Macro Global", "�
 
 with tab1:
     st.subheader("Panorama de Mercado")
-    
     c1, c2, c3, c4 = st.columns(4)
     with c1: render_card_advanced("S&P 500", "SP500")
     with c2: render_card_advanced("Merval", "Merval")
@@ -188,7 +177,6 @@ with tab1:
     with c4: render_card_advanced("Brent", "Brent", prefix="USD ")
     
     st.markdown("<br>", unsafe_allow_html=True)
-    
     c5, c6, c7, c8 = st.columns(4)
     with c5: render_card_advanced("Dólar Oficial", "USD_Oficial", prefix="$")
     with c6: render_card_advanced("Riesgo País", "Riesgo_Pais", suffix=" bps")
