@@ -57,7 +57,6 @@ def load_data():
                 df = df.loc[:, df.columns != '']
                 df = df.loc[:, ~df.columns.duplicated()]
                 
-                # Formateo de fechas y eliminación de duplicados para cálculos limpios
                 if 'fecha' in df.columns:
                     df['fecha'] = pd.to_datetime(df['fecha'], errors='coerce', format='mixed', dayfirst=True)
                     df = df.dropna(subset=['fecha']).drop_duplicates(subset=['fecha'], keep='last').sort_values('fecha')
@@ -102,10 +101,15 @@ def get_kpi_advanced(col_name):
         actual = df[col_name].iloc[-1]
         prev_1d = df[col_name].iloc[-2] if len(df) > 1 else actual
         
+        # 🌟 CÁLCULO SEGURO DEL MES ANTERIOR (A PRUEBA DE FALLOS)
         hace_1m = df['fecha'].iloc[-1] - pd.Timedelta(days=30)
-        m1_val = df.loc[(df['fecha'] - hace_1m).abs().idxmin(), col_name]
-
-        # Identificamos si es una métrica en puntos (donde suba = malo)
+        df_m1 = df[df['fecha'] <= hace_1m]
+        
+        if not df_m1.empty:
+            m1_val = df_m1.iloc[-1][col_name] # Toma el valor más reciente que sea <= a 30 días atrás
+        else:
+            m1_val = df[col_name].iloc[0] # Si la base de datos tiene menos de un mes, toma el dato más viejo
+            
         is_points = col_name in ['Riesgo_Pais', 'Brecha_CCL']
         
         if is_points:
@@ -129,11 +133,15 @@ def render_card_advanced(title, col_name, prefix="", suffix=""):
     
     def get_style(delta, is_inv):
         if val == "N/A": return "N/A", "d-flat"
-        if abs(delta) < 0.005: return "▬ 0.00", "d-flat"
+        
+        unidad = " pp" if (is_points and col_name == 'Brecha_CCL') else " bps" if is_points else "%"
+        
+        # Tolerancia estricta a cero para evitar el -0.00
+        if abs(delta) < 0.005: 
+            return f"▬ 0.00{unidad}", "d-flat"
         
         symbol = "▲" if delta > 0 else "▼"
-        # Mostramos 'pp' para brecha, 'bps' para riesgo país, '%' para el resto
-        label = f"{abs(delta):.2f}" + (" pp" if (is_points and col_name == 'Brecha_CCL') else " bps" if is_points else "%")
+        label = f"{abs(delta):.2f}{unidad}"
         
         if is_inv:
             color = "d-up-bad" if delta > 0 else "d-down-good"
@@ -170,7 +178,6 @@ def aplicar_estilo_bloomberg(fig):
 # ==========================================
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["📌 Resumen", "🌎 Macro Global", "🇦🇷 Argentina", "🏗️ Inmobiliario", "💼 Portafolio"])
 
-# --- TAB 1: RESUMEN ---
 with tab1:
     st.subheader("Panorama de Mercado")
     
@@ -211,7 +218,6 @@ with tab1:
                 </div>
             """, unsafe_allow_html=True)
 
-# --- TAB 2: MACRO GLOBAL ---
 with tab2:
     st.subheader("Contexto Internacional y Tasas")
     col1, col2 = st.columns(2)
@@ -234,7 +240,6 @@ with tab2:
                 st.plotly_chart(aplicar_estilo_bloomberg(fig_yield), use_container_width=True)
             else: st.info("Datos no disponibles.")
 
-# --- TAB 3: ARGENTINA ---
 with tab3:
     st.subheader("Variables Monetarias Locales")
     if not df_hist.empty:
@@ -246,12 +251,10 @@ with tab3:
             st.plotly_chart(aplicar_estilo_bloomberg(fig_usd), use_container_width=True)
         else: st.info("Datos no disponibles.")
 
-# --- TAB 4: INMOBILIARIO ---
 with tab4:
     st.subheader("Mercado Inmobiliario")
     st.info("💡 Espacio reservado para el módulo de Real Estate.")
 
-# --- TAB 5: PORTAFOLIO ---
 with tab5:
     st.subheader("Portafolio de Inversión")
     st.info("💡 Espacio reservado para Asset Allocation.")
