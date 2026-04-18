@@ -21,7 +21,7 @@ st.markdown("""
     .m-title { font-size: 16px; color: #cbd5e1; font-weight: 800; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 10px; }
     .m-val { font-size: 26px; color: #f8fafc; font-weight: 700; font-family: 'Courier New', monospace; margin-bottom: 15px; }
     
-    .m-deltas { display: flex; justify-content: space-between; font-size: 16px; font-weight: 800; padding-top: 12px; border-top: 1px solid #1e293b; }
+    .m-deltas { display: flex; justify-content: space-between; font-size: 14px; font-weight: 800; padding-top: 12px; border-top: 1px solid #1e293b; }
     
     .d-up-good { color: #10b981; }   
     .d-down-bad { color: #ef4444; }  
@@ -54,11 +54,9 @@ def fetch_database_data_v3():
                 df = pd.DataFrame(data[1:], columns=data[0])
                 df = df.loc[:, df.columns != '']
                 df = df.loc[:, ~df.columns.duplicated()]
-                
                 if 'fecha' in df.columns:
                     df['fecha'] = pd.to_datetime(df['fecha'], errors='coerce')
                     df = df.dropna(subset=['fecha']).drop_duplicates(subset=['fecha'], keep='last').sort_values('fecha')
-                
                 return df
             return pd.DataFrame()
         except: return pd.DataFrame()
@@ -77,8 +75,17 @@ def get_fear_and_greed():
 fng_val, fng_class = get_fear_and_greed()
 
 # ==========================================
-# 3. LÓGICA FINANCIERA DE VARIACIONES (1D, 1M, 1A)
+# 3. LÓGICA MATEMÁTICA Y GRÁFICOS
 # ==========================================
+def aplicar_estilo_bloomberg(fig):
+    fig.update_layout(
+        xaxis_title="", yaxis_title="", legend_title="",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(l=0, r=0, t=30, b=0), hovermode="x unified"
+    )
+    fig.update_traces(line=dict(width=2.5))
+    return fig
+
 def get_kpi_3d(col_name):
     try:
         if col_name not in df_hist.columns: return "N/A", 0, 0, 0, False
@@ -91,7 +98,6 @@ def get_kpi_3d(col_name):
         actual = df[col_name].iloc[-1]
         prev_1d = df[col_name].iloc[-2] if len(df) > 1 else actual
         
-        # Función auxiliar para buscar fechas pasadas de forma segura
         def get_past_val(days_ago):
             target_date = df['fecha'].iloc[-1] - timedelta(days=days_ago)
             past_df = df[df['fecha'] <= target_date]
@@ -128,12 +134,10 @@ def render_card_3d(title, col_name, prefix="", suffix=""):
         if abs(delta) < 0.005: return f"▬ 0.00{unidad}", "d-flat"
         
         symbol = "▲" if delta > 0 else "▼"
-        label = f"{abs(delta):.1f}{unidad}" # Usamos un solo decimal para que entren los 3
+        label = f"{abs(delta):.1f}{unidad}"
         
-        if is_inv:
-            color = "d-up-bad" if delta > 0 else "d-down-good"
-        else:
-            color = "d-up-good" if delta > 0 else "d-down-bad"
+        if is_inv: color = "d-up-bad" if delta > 0 else "d-down-good"
+        else: color = "d-up-good" if delta > 0 else "d-down-bad"
             
         return f"{symbol} {label}", color
 
@@ -197,7 +201,6 @@ with tab1:
                 </div>
             """, unsafe_allow_html=True)
 
-# --- TAB 2: MACRO GLOBAL ---
 with tab2:
     st.subheader("Contexto Internacional y Tasas")
     col1, col2 = st.columns(2)
@@ -209,7 +212,6 @@ with tab2:
                 for c in tasas_cols: df_macro[c] = pd.to_numeric(df_macro[c], errors='coerce')
                 fig_tasas = px.line(df_macro, x='fecha', y=tasas_cols, template='plotly_dark', color_discrete_sequence=['#38bdf8', '#34d399'])
                 st.plotly_chart(aplicar_estilo_bloomberg(fig_tasas), use_container_width=True)
-            else: st.info("Datos no disponibles.")
         with col2:
             st.markdown("**Yield Curve (10Y - 2Y)**")
             if 'T10Y2Y' in df_macro.columns:
@@ -217,9 +219,7 @@ with tab2:
                 fig_yield = px.area(df_macro, x='fecha', y='T10Y2Y', template='plotly_dark', color_discrete_sequence=['#f59e0b'])
                 fig_yield.update_traces(fillcolor='rgba(245, 158, 11, 0.2)', line=dict(width=2)) 
                 st.plotly_chart(aplicar_estilo_bloomberg(fig_yield), use_container_width=True)
-            else: st.info("Datos no disponibles.")
 
-# --- TAB 3: ARGENTINA ---
 with tab3:
     st.subheader("Variables Monetarias Locales")
     if not df_hist.empty:
@@ -229,18 +229,15 @@ with tab3:
             for c in usd_cols: df_hist[c] = pd.to_numeric(df_hist[c], errors='coerce')
             fig_usd = px.line(df_hist, x='fecha', y=usd_cols, template='plotly_dark', color_discrete_sequence=['#94a3b8', '#38bdf8', '#34d399'])
             st.plotly_chart(aplicar_estilo_bloomberg(fig_usd), use_container_width=True)
-        else: st.info("Datos no disponibles.")
 
-# --- TAB 4: EXPECTATIVAS Y FUTUROS (NUEVO DISEÑO MINIMALISTA) ---
 with tab4:
     st.subheader("Curvas de Futuros y Expectativas (REM)")
     st.caption("Maqueta visual: Datos fijos de demostración. Sin gráficos, foco en tasas implícitas.")
     
     st.markdown("### Dólar Futuro (Matba Rofex)")
     col1, col2, col3, col4 = st.columns(4)
-    # Ejemplo de cómo se vería una tarjeta de futuros sin gráficos
     def render_future_card(contrato, precio, tna, delta_precio):
-        color = "color: #10b981;" if delta_precio < 0 else "color: #ef4444;" # Si el dolar futuro sube, es alerta roja
+        color = "color: #10b981;" if delta_precio < 0 else "color: #ef4444;"
         st.markdown(f"""
         <div class="metric-card" style="padding: 15px;">
             <div style="font-size: 14px; color: #94a3b8; font-weight: bold; text-transform: uppercase;">{contrato}</div>
@@ -258,15 +255,13 @@ with tab4:
     
     st.markdown("<br>### Inflación Esperada (REM BCRA)", unsafe_allow_html=True)
     col5, col6, col7, col8 = st.columns(4)
-    with col5: render_future_card("IPC Mes Próximo", "4.5", "-", -0.2) # En inflación, bajar es verde
+    with col5: render_future_card("IPC Mes Próximo", "4.5", "-", -0.2)
     with col6: render_future_card("IPC 12 Meses", "65.0", "-", -2.5)
 
-# --- TAB 5: INMOBILIARIO ---
 with tab5:
     st.subheader("Mercado Inmobiliario")
     st.info("💡 Espacio reservado para el módulo de Real Estate.")
 
-# --- TAB 6: PORTAFOLIO ---
 with tab6:
     st.subheader("Portafolio de Inversión")
     st.info("💡 Espacio reservado para Asset Allocation.")
