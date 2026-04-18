@@ -208,11 +208,11 @@ Aquí tienes los titulares financieros del día en Argentina (filtrados por impa
 {noticias_hoy}
 
 REGLA DE ORO: Cero introducción, cero conclusiones genéricas, cero 'saraza'. NO repitas los números exactos que te pasé arriba. 
-Basándote en los datos y especialmente en la info de los TITULARES, escribí 3 viñetas crudas y objetivas (máximo 2 oraciones cada una):
+Escribí 3 viñetas crudas y objetivas (máximo 2 oraciones cada una), respetando OBLIGATORIAMENTE este formato de inicio para cada línea:
 
-1. Un driver clave del día en el Mundo (tasas/commodities/USA).
-2. Un driver clave del día en Argentina (usando la info de los titulares).
-3. Dato crítico a mirar mañana.
+* **🌎 Mundo:** [Tu análisis de un driver clave global]
+* **🇦🇷 Argentina:** [Tu análisis local usando la info de los titulares]
+* **🔮 A mirar mañana:** [Tu alerta sobre qué dato o evento vigilar de cerca]
 """
 url_ai = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={GEMINI_API_KEY}"
 try:
