@@ -33,6 +33,25 @@ st.markdown("""
     .ai-box { background-color: #0a1525; border: 1px solid #1a3050; border-radius: 8px; padding: 20px; height: 100%; margin-top: 0; }
     .ai-title { color: #38bdf8; font-size: 13px; font-weight: bold; text-transform: uppercase; margin-bottom: 15px; display: flex; align-items: center; gap: 8px;}
     .ai-text { color: #cbd5e1; font-size: 14px; line-height: 1.6; }
+
+    /* ==================================================== */
+    /* MODO CELULAR (Se activa solo en pantallas chicas)    */
+    /* ==================================================== */
+    @media (max-width: 768px) {
+        .metric-card { padding: 12px; } /* Achicamos los bordes internos */
+        .m-title { font-size: 13px; margin-bottom: 5px; }
+        .m-val { font-size: 20px; margin-bottom: 10px; } /* Número principal más chico */
+        .m-deltas { font-size: 12px; padding-top: 8px; } /* Porcentajes más chicos */
+        .d-label { font-size: 9px; }
+        .section-title { font-size: 18px; margin-top: 15px; margin-bottom: 10px; }
+        
+        /* Achicamos la caja de la IA */
+        .ai-box { padding: 15px; }
+        .ai-text { font-size: 13px; }
+        
+        /* Reducimos el espacio muerto nativo de Streamlit arriba y abajo */
+        .block-container { padding-top: 1.5rem; padding-bottom: 1rem; }
+    }
     </style>
 """, unsafe_allow_html=True)
 
