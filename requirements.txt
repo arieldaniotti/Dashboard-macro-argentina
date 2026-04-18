@@ -6,5 +6,4 @@ google-auth
 yfinance
 requests
 pandas-datareader
-Plaintext
 feedparser
