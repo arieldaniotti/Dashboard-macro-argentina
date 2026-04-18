@@ -239,15 +239,95 @@ with tab2:
                 fig_yield.update_traces(fillcolor='rgba(245, 158, 11, 0.2)', line=dict(width=2)) 
                 st.plotly_chart(aplicar_estilo_bloomberg(fig_yield), use_container_width=True)
 
+# --- TAB 3: ARGENTINA (Visión Estratégica) ---
 with tab3:
-    st.subheader("Variables Monetarias Locales")
-    if not df_hist.empty:
-        st.markdown("**Dólar Oficial vs Blue vs CCL**")
-        usd_cols = [c for c in ['USD_Oficial', 'USD_Blue', 'CCL'] if c in df_hist.columns]
-        if usd_cols:
-            for c in usd_cols: df_hist[c] = pd.to_numeric(df_hist[c], errors='coerce')
-            fig_usd = px.line(df_hist, x='fecha', y=usd_cols, template='plotly_dark', color_discrete_sequence=['#94a3b8', '#38bdf8', '#34d399'])
-            st.plotly_chart(aplicar_estilo_bloomberg(fig_usd), use_container_width=True)
+    st.markdown('<div class="section-title">📊 ESTRATEGIA Y MACROECONOMÍA</div>', unsafe_allow_html=True)
+    
+    # Bloque 1: Macro Superior (Contexto)
+    c1, c2, c3 = st.columns(3)
+    with c1: render_card_3d("Inflación (IPC)", "IPC", suffix="%")
+    with c2: render_card_3d("Actividad (EMAE)", "EMAE", suffix=" pts")
+    with c3: render_card_3d("Salario Real (RIPTE)", "RIPTE", prefix="$")
+
+    st.markdown("<br><hr>", unsafe_allow_html=True)
+    
+    # Bloque 2: Gráficos de Valor Real (Estilo Institucional)
+    st.markdown("### 🔍 Análisis de Valor Real en USD")
+    st.caption("Rendimientos y costos netos tras descontar la inflación en dólares (Dólar Constante).")
+    
+    col_inv, col_fin = st.columns(2)
+    
+    import plotly.graph_objects as go
+
+    # 1. GRÁFICO DE INVERSIONES
+    with col_inv:
+        st.markdown("**💰 Inversiones vs Inflación USD (Últimos 12M)**")
+        
+        # Datos simulados para la maqueta visual
+        df_inv = pd.DataFrame({
+            "Activo": ["Merval", "AL30", "S&P 500", "Lecap", "m2 Venta", "Plazo Fijo"],
+            "Retorno_Real_USD": [25.4, 18.2, 8.5, 2.1, -1.5, -8.4]
+        }).sort_values("Retorno_Real_USD", ascending=True) # Ordenado para que quede escalonado
+        
+        # Lógica de colores: Mayor a 0 (gana a la inflación) = Verde. Menor = Rojo.
+        colores_inv = ['#10b981' if val > 0 else '#ef4444' for val in df_inv["Retorno_Real_USD"]]
+        
+        fig_inv = go.Figure(go.Bar(
+            x=df_inv["Retorno_Real_USD"], 
+            y=df_inv["Activo"], 
+            orientation='h',
+            marker_color=colores_inv,
+            text=[f"{val}%" for val in df_inv["Retorno_Real_USD"]],
+            textposition='outside',
+            textfont=dict(color='#cbd5e1', size=12)
+        ))
+        
+        fig_inv.update_layout(
+            template='plotly_dark',
+            paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+            margin=dict(l=0, r=40, t=20, b=0),
+            xaxis=dict(showgrid=True, gridcolor='#1e293b', zeroline=True, zerolinecolor='#94a3b8', zerolinewidth=2),
+            yaxis=dict(showgrid=False)
+        )
+        # Línea Cero (Benchmark Inflación)
+        fig_inv.add_vline(x=0, line_width=2, line_dash="dash", line_color="#cbd5e1", annotation_text=" Inflación USD (0%)", annotation_position="top right")
+        
+        st.plotly_chart(fig_inv, use_container_width=True)
+
+    # 2. GRÁFICO DE FINANCIAMIENTO
+    with col_fin:
+        st.markdown("**💳 Costo de Financiamiento Real en USD**")
+        
+        # Datos simulados para la maqueta visual
+        df_fin = pd.DataFrame({
+            "Línea de Crédito": ["Adelanto Cta Cte", "Tarjeta Crédito", "Préstamo Personal", "Hipotecario UVA", "Prendario", "Desc. Cheques"],
+            "Costo_Real_USD": [15.2, 8.4, 5.1, 2.0, -1.2, -4.5]
+        }).sort_values("Costo_Real_USD", ascending=True)
+        
+        # Lógica Invertida: Mayor a 0 (costo real caro) = Rojo. Menor a 0 (se licúa) = Verde.
+        colores_fin = ['#ef4444' if val > 0 else '#10b981' for val in df_fin["Costo_Real_USD"]]
+        
+        fig_fin = go.Figure(go.Bar(
+            x=df_fin["Costo_Real_USD"], 
+            y=df_fin["Línea de Crédito"], 
+            orientation='h',
+            marker_color=colores_fin,
+            text=[f"{val}%" for val in df_fin["Costo_Real_USD"]],
+            textposition='outside',
+            textfont=dict(color='#cbd5e1', size=12)
+        ))
+        
+        fig_fin.update_layout(
+            template='plotly_dark',
+            paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+            margin=dict(l=0, r=40, t=20, b=0),
+            xaxis=dict(showgrid=True, gridcolor='#1e293b', zeroline=True, zerolinecolor='#94a3b8', zerolinewidth=2),
+            yaxis=dict(showgrid=False)
+        )
+        # Línea Cero (Benchmark Inflación)
+        fig_fin.add_vline(x=0, line_width=2, line_dash="dash", line_color="#cbd5e1", annotation_text=" Inflación USD (0%)", annotation_position="top right")
+        
+        st.plotly_chart(fig_fin, use_container_width=True
 
 with tab4:
     st.subheader("Curvas de Futuros y Expectativas (REM)")
