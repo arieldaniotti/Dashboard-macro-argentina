@@ -5,7 +5,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta
 
-print("🚀 Iniciando Pipeline V9 (Full Integración)...")
+print("🚀 Iniciando Pipeline V9 (Full Integración - Fix Fechas)...")
 
 # --- CONFIG ---
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
@@ -26,7 +26,10 @@ df_oficial = pd.DataFrame(fetch("https://api.argentinadatos.com/v1/cotizaciones/
 df_rp = pd.DataFrame(fetch("https://api.argentinadatos.com/v1/finanzas/indices/riesgo-pais")).rename(columns={"valor":"Riesgo_Pais"})
 df_ipc = pd.DataFrame(fetch("https://api.argentinadatos.com/v1/finanzas/indices/inflacion")).rename(columns={"valor":"IPC"})
 
-df_oficial["fecha"] = pd.to_datetime(df_oficial["fecha"])
+# FIX: Convertimos TODAS las fechas a formato datetime para evitar errores de merge
+if not df_oficial.empty: df_oficial["fecha"] = pd.to_datetime(df_oficial["fecha"])
+if not df_rp.empty: df_rp["fecha"] = pd.to_datetime(df_rp["fecha"])
+if not df_ipc.empty and "fecha" in df_ipc.columns: df_ipc["fecha"] = pd.to_datetime(df_ipc["fecha"])
 
 # --- CÁLCULO BENCHMARKS (1M y 1A) ---
 def calc_bench(months):
@@ -55,9 +58,11 @@ def get_news():
     kw = ['caputo', 'bcra', 'inflación', 'dólar', 'fmi', 'milei']
     titles = []
     for f in feeds:
-        d = feedparser.parse(f)
-        for e in d.entries[:10]:
-            if any(k in e.title.lower() for k in kw): titles.append(e.title)
+        try:
+            d = feedparser.parse(f)
+            for e in d.entries[:10]:
+                if any(k in e.title.lower() for k in kw): titles.append(e.title)
+        except: pass
     return "\n- ".join(titles[:12])
 
 # --- 3. GOOGLE SHEETS ---
@@ -66,16 +71,21 @@ def write_ws(name, df):
     except: ws = sh.add_worksheet(title=name, rows="1000", cols="20")
     ws.update([df.columns.values.tolist()] + df.astype(str).replace('nan', '').values.tolist())
 
+# Merge final seguro (ahora ambas fechas hablan el mismo idioma)
 df_final = df_m.merge(df_oficial[["fecha", "USD_Oficial"]], on="fecha", how="outer").ffill()
 df_final["CCL"] = (df_final["GGAL_LOC"] / (df_final["GGAL_ADR"] / 10)).round(2)
 df_final["Brecha_CCL"] = (((df_final["CCL"] / df_final["USD_Oficial"]) - 1) * 100).round(2)
 df_final = df_final.merge(df_rp[["fecha", "Riesgo_Pais"]], on="fecha", how="left").ffill()
+
 write_ws("DB_Historico", df_final)
 
 # --- 4. IA FLASH MARKET ---
 prompt = f"Trader de Mesa. Hoy: {hoy.strftime('%d/%m/%Y')}. Titulares: {get_news()}. Escribí 3 viñetas (* **🌎 Mundo:**, * **🇦🇷 Argentina:**, * **🔮 A mirar mañana:**). Al final, explicá en un párrafo 'EL DATO REAL' sobre el encarecimiento de {bench_1m}% en USD este mes para el bolsillo de Doña Rosa."
-res = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={GEMINI_API_KEY}", json={"contents": [{"parts": [{"text": prompt}]}]}).json()
-texto_ia = res['candidates'][0]['content']['parts'][0]['text']
+try:
+    res = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={GEMINI_API_KEY}", json={"contents": [{"parts": [{"text": prompt}]}]}).json()
+    texto_ia = res['candidates'][0]['content']['parts'][0]['text']
+except:
+    texto_ia = "Error al generar análisis con IA."
 
 write_ws("DB_Insights", pd.DataFrame({"Analisis_LLM": [texto_ia], "Bench_1M": [bench_1m], "Bench_1A": [bench_1a]}))
 print("🏁 Pipeline V9 Finalizado.")
