@@ -3,6 +3,7 @@ import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
 import plotly.express as px
+import plotly.graph_objects as go
 import requests
 from datetime import timedelta
 
@@ -38,18 +39,14 @@ st.markdown("""
     /* MODO CELULAR (Se activa solo en pantallas chicas)    */
     /* ==================================================== */
     @media (max-width: 768px) {
-        .metric-card { padding: 12px; } /* Achicamos los bordes internos */
+        .metric-card { padding: 12px; }
         .m-title { font-size: 13px; margin-bottom: 5px; }
-        .m-val { font-size: 20px; margin-bottom: 10px; } /* Número principal más chico */
-        .m-deltas { font-size: 12px; padding-top: 8px; } /* Porcentajes más chicos */
+        .m-val { font-size: 20px; margin-bottom: 10px; }
+        .m-deltas { font-size: 12px; padding-top: 8px; }
         .d-label { font-size: 9px; }
         .section-title { font-size: 18px; margin-top: 15px; margin-bottom: 10px; }
-        
-        /* Achicamos la caja de la IA */
         .ai-box { padding: 15px; }
         .ai-text { font-size: 13px; }
-        
-        /* Reducimos el espacio muerto nativo de Streamlit arriba y abajo */
         .block-container { padding-top: 1.5rem; padding-bottom: 1rem; }
     }
     </style>
@@ -241,126 +238,4 @@ with tab2:
 
 # --- TAB 3: ARGENTINA (Visión Estratégica) ---
 with tab3:
-    st.markdown('<div class="section-title">📊 ESTRATEGIA Y MACROECONOMÍA</div>', unsafe_allow_html=True)
-    
-    # Bloque 1: Macro Superior (Contexto)
-    c1, c2, c3 = st.columns(3)
-    with c1: render_card_3d("Inflación (IPC)", "IPC", suffix="%")
-    with c2: render_card_3d("Actividad (EMAE)", "EMAE", suffix=" pts")
-    with c3: render_card_3d("Salario Real (RIPTE)", "RIPTE", prefix="$")
-
-    st.markdown("<br><hr>", unsafe_allow_html=True)
-    
-    # Bloque 2: Gráficos de Valor Real (Estilo Institucional)
-    st.markdown("### 🔍 Análisis de Valor Real en USD")
-    st.caption("Rendimientos y costos netos tras descontar la inflación en dólares (Dólar Constante).")
-    
-    col_inv, col_fin = st.columns(2)
-    
-    import plotly.graph_objects as go
-
-    # 1. GRÁFICO DE INVERSIONES
-    with col_inv:
-        st.markdown("**💰 Inversiones vs Inflación USD (Últimos 12M)**")
-        
-        # Datos simulados para la maqueta visual
-        df_inv = pd.DataFrame({
-            "Activo": ["Merval", "AL30", "S&P 500", "Lecap", "m2 Venta", "Plazo Fijo"],
-            "Retorno_Real_USD": [25.4, 18.2, 8.5, 2.1, -1.5, -8.4]
-        }).sort_values("Retorno_Real_USD", ascending=True) # Ordenado para que quede escalonado
-        
-        # Lógica de colores: Mayor a 0 (gana a la inflación) = Verde. Menor = Rojo.
-        colores_inv = ['#10b981' if val > 0 else '#ef4444' for val in df_inv["Retorno_Real_USD"]]
-        
-        fig_inv = go.Figure(go.Bar(
-            x=df_inv["Retorno_Real_USD"], 
-            y=df_inv["Activo"], 
-            orientation='h',
-            marker_color=colores_inv,
-            text=[f"{val}%" for val in df_inv["Retorno_Real_USD"]],
-            textposition='outside',
-            textfont=dict(color='#cbd5e1', size=12)
-        ))
-        
-        fig_inv.update_layout(
-            template='plotly_dark',
-            paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
-            margin=dict(l=0, r=40, t=20, b=0),
-            xaxis=dict(showgrid=True, gridcolor='#1e293b', zeroline=True, zerolinecolor='#94a3b8', zerolinewidth=2),
-            yaxis=dict(showgrid=False)
-        )
-        # Línea Cero (Benchmark Inflación)
-        fig_inv.add_vline(x=0, line_width=2, line_dash="dash", line_color="#cbd5e1", annotation_text=" Inflación USD (0%)", annotation_position="top right")
-        
-        st.plotly_chart(fig_inv, use_container_width=True)
-
-    # 2. GRÁFICO DE FINANCIAMIENTO
-    with col_fin:
-        st.markdown("**💳 Costo de Financiamiento Real en USD**")
-        
-        # Datos simulados para la maqueta visual
-        df_fin = pd.DataFrame({
-            "Línea de Crédito": ["Adelanto Cta Cte", "Tarjeta Crédito", "Préstamo Personal", "Hipotecario UVA", "Prendario", "Desc. Cheques"],
-            "Costo_Real_USD": [15.2, 8.4, 5.1, 2.0, -1.2, -4.5]
-        }).sort_values("Costo_Real_USD", ascending=True)
-        
-        # Lógica Invertida: Mayor a 0 (costo real caro) = Rojo. Menor a 0 (se licúa) = Verde.
-        colores_fin = ['#ef4444' if val > 0 else '#10b981' for val in df_fin["Costo_Real_USD"]]
-        
-        fig_fin = go.Figure(go.Bar(
-            x=df_fin["Costo_Real_USD"], 
-            y=df_fin["Línea de Crédito"], 
-            orientation='h',
-            marker_color=colores_fin,
-            text=[f"{val}%" for val in df_fin["Costo_Real_USD"]],
-            textposition='outside',
-            textfont=dict(color='#cbd5e1', size=12)
-        ))
-        
-        fig_fin.update_layout(
-            template='plotly_dark',
-            paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
-            margin=dict(l=0, r=40, t=20, b=0),
-            xaxis=dict(showgrid=True, gridcolor='#1e293b', zeroline=True, zerolinecolor='#94a3b8', zerolinewidth=2),
-            yaxis=dict(showgrid=False)
-        )
-        # Línea Cero (Benchmark Inflación)
-        fig_fin.add_vline(x=0, line_width=2, line_dash="dash", line_color="#cbd5e1", annotation_text=" Inflación USD (0%)", annotation_position="top right")
-        
-        st.plotly_chart(fig_fin, use_container_width=True
-
-with tab4:
-    st.subheader("Curvas de Futuros y Expectativas (REM)")
-    st.caption("Maqueta visual: Datos fijos de demostración. Sin gráficos, foco en tasas implícitas.")
-    
-    st.markdown("### Dólar Futuro (Matba Rofex)")
-    col1, col2, col3, col4 = st.columns(4)
-    def render_future_card(contrato, precio, tna, delta_precio):
-        color = "color: #10b981;" if delta_precio < 0 else "color: #ef4444;"
-        st.markdown(f"""
-        <div class="metric-card" style="padding: 15px;">
-            <div style="font-size: 14px; color: #94a3b8; font-weight: bold; text-transform: uppercase;">{contrato}</div>
-            <div style="font-size: 24px; color: #f8fafc; font-weight: bold; font-family: monospace; margin: 8px 0;">$ {precio}</div>
-            <div style="display: flex; justify-content: space-between; font-size: 14px; border-top: 1px solid #1e293b; padding-top: 8px;">
-                <span style="color: #38bdf8; font-weight: bold;">TNA: {tna}%</span>
-                <span style="{color} font-weight: bold;">{delta_precio}% 1D</span>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    with col1: render_future_card("Fin Mes Actual", "1.415,50", "45.2", 0.15)
-    with col2: render_future_card("Fin Próximo Mes", "1.468,20", "48.5", -0.05)
-    with col3: render_future_card("Diciembre", "1.750,00", "52.1", 1.20)
-    
-    st.markdown("<br>### Inflación Esperada (REM BCRA)", unsafe_allow_html=True)
-    col5, col6, col7, col8 = st.columns(4)
-    with col5: render_future_card("IPC Mes Próximo", "4.5", "-", -0.2)
-    with col6: render_future_card("IPC 12 Meses", "65.0", "-", -2.5)
-
-with tab5:
-    st.subheader("Mercado Inmobiliario")
-    st.info("💡 Espacio reservado para el módulo de Real Estate.")
-
-with tab6:
-    st.subheader("Portafolio de Inversión")
-    st.info("💡 Espacio reservado para Asset Allocation.")
+    st.markdown('<div class="section-title">📊 E
