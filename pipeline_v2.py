@@ -6,13 +6,13 @@ import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta
-import numpy as np
 import time
+import feedparser
 
 # ==========================================
-# 1. CONFIGURACIÓN Y SEGURIDAD (GitHub Secrets)
+# 1. CONFIGURACIÓN Y SEGURIDAD
 # ==========================================
-print("🚀 Iniciando Pipeline Automatizado V4.2 (Fijado IA)...")
+print("🚀 Iniciando Pipeline Automatizado V6 (News Filtered)...")
 
 FRED_API_KEY   = os.environ.get("FRED_API_KEY")
 CHILE_USER     = os.environ.get("CHILE_USER")
@@ -34,7 +34,7 @@ hace_1a      = hoy - timedelta(days=365)
 fecha_inicio = hace_1a.strftime("%Y-%m-%d")
 
 # ==========================================
-# 2. FUNCIONES DE EXTRACCIÓN
+# 2. FUNCIONES DE EXTRACCIÓN MACRO
 # ==========================================
 def fetch_api_data(url):
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -43,7 +43,6 @@ def fetch_api_data(url):
         res.raise_for_status()
         return res.json()
     except Exception as e:
-        print(f"⚠️ Error en API {url.split('/')[2]}: {e}")
         return []
 
 def get_fred_series(series_id, api_key, start_date):
@@ -67,8 +66,7 @@ def get_bcb_data(serie_id, nombre_columna):
         df['data'] = pd.to_datetime(df['data'], format='%d/%m/%Y')
         df['valor'] = df['valor'].astype(float)
         return df.rename(columns={'data': 'fecha', 'valor': nombre_columna})
-    except:
-        return pd.DataFrame(columns=['fecha', nombre_columna])
+    except: return pd.DataFrame(columns=['fecha', nombre_columna])
 
 def get_chile_data(series_id, nombre_columna, user, password, start_date):
     url = f"https://si3.bcentral.cl/SieteRestWS/SieteRestWS.ashx?user={user}&pass={password}&firstdate={start_date}&timeseries={series_id}&function=GetSeries"
@@ -81,14 +79,56 @@ def get_chile_data(series_id, nombre_columna, user, password, start_date):
                 df['fecha'] = pd.to_datetime(df['indexDateString'], format='%d-%m-%Y')
                 df['valor'] = pd.to_numeric(df['value'], errors='coerce')
                 return df[['fecha', 'valor']].rename(columns={'valor': nombre_columna})
-    except:
-        pass
+    except: pass
     return pd.DataFrame(columns=['fecha', nombre_columna])
 
 # ==========================================
-# 3. PROCESO DE DATOS
+# 3. EXTRACCIÓN DE NOTICIAS (RSS + FILTRO INTELIGENTE)
 # ==========================================
-print("📥 Descargando datos (Arg, Global, Macro)...")
+print("📰 Buscando noticias con filtros clave...")
+def get_daily_news():
+    feeds = [
+        "https://www.ambito.com/rss/economia.xml",
+        "https://www.cronista.com/files/rss/finanzas-mercados.xml",
+        "https://www.iprofesional.com/rss/finanzas",
+        "https://www.infobae.com/economia/rss.xml",
+        "https://eleconomista.com.ar/rss/finanzas.xml",
+        "https://es.investing.com/rss/news_25.rss"
+    ]
+    
+    # Palabras clave del mercado
+    keywords = ['caputo', 'bcra', 'trump', 'fed', 'inflación', 'cepo', 'dólar', 'riesgo país', 'merval', 'bonos', 'fmi', 'reservas', 'bopreal', 'milei']
+    
+    titulares_filtrados = []
+    
+    for f in feeds:
+        try:
+            d = feedparser.parse(f)
+            count = 0
+            for entry in d.entries:
+                titulo_lower = entry.title.lower()
+                # Si alguna palabra clave está en el título, lo guardamos
+                if any(kw in titulo_lower for kw in keywords):
+                    titulares_filtrados.append(entry.title)
+                    count += 1
+                
+                # Máximo 3 noticias por diario para no saturar
+                if count >= 3:
+                    break
+        except: pass
+    
+    if not titulares_filtrados:
+        return "Sin noticias de alto impacto hoy."
+    
+    # Nos quedamos con un máximo de 15 titulares en total para ahorrar tokens
+    return "\n- ".join([""] + titulares_filtrados[:15])
+
+noticias_hoy = get_daily_news()
+
+# ==========================================
+# 4. PROCESO DE DATOS
+# ==========================================
+print("📥 Procesando mercado y Arg...")
 df_blue = pd.DataFrame(fetch_api_data("https://api.argentinadatos.com/v1/cotizaciones/dolares/blue")).rename(columns={"venta":"USD_Blue"})
 df_oficial = pd.DataFrame(fetch_api_data("https://api.argentinadatos.com/v1/cotizaciones/dolares/oficial")).rename(columns={"venta":"USD_Oficial"})
 df_rp = pd.DataFrame(fetch_api_data("https://api.argentinadatos.com/v1/finanzas/indices/riesgo-pais")).rename(columns={"valor":"Riesgo_Pais"})
@@ -137,7 +177,7 @@ def get_metrics(df):
 df_resumen = get_metrics(df_final)
 
 # ==========================================
-# 4. CARGA A GOOGLE SHEETS
+# 5. CARGA A GOOGLE SHEETS
 # ==========================================
 print("📤 Actualizando Google Sheets...")
 def write_ws(sh, name, df):
@@ -157,26 +197,29 @@ df_macro_sheet['fecha'] = df_macro_sheet['fecha'].dt.strftime("%d/%m/%Y")
 write_ws(sh, "DB_Macro", df_macro_sheet)
 
 # ==========================================
-# 5. CEREBRO IA (Gemini - Formato Corregido)
+# 6. CEREBRO IA (Gemini - Flash Market con Noticias)
 # ==========================================
-print("🧠 Generando análisis IA...")
+print("🧠 Generando análisis IA (incorporando RSS)...")
 prompt = f"""
 Sos un Trader de Mesa institucional. Hoy es {hoy.strftime('%d/%m/%Y')}. 
-Datos: S&P en {df_final['SP500'].iloc[-1]}, Brent en {df_final['Brent'].iloc[-1]}, Riesgo País ARG en {df_final['Riesgo_Pais'].iloc[-1]} y Brecha Cambiaria en {df_final['Brecha_CCL'].iloc[-1]}%.
+Datos del mercado cerraron con: S&P en {df_final['SP500'].iloc[-1]}, Brent en {df_final['Brent'].iloc[-1]}, Riesgo País ARG en {df_final['Riesgo_Pais'].iloc[-1]} y Brecha Cambiaria en {df_final['Brecha_CCL'].iloc[-1]}%.
 
-REGLA DE ORO: Cero introducción, cero conclusiones genéricas, cero 'saraza'. NO repitas los números exactos. Escribí 3 viñetas crudas y objetivas (máximo 2 oraciones cada una):
+Aquí tienes los titulares financieros del día en Argentina (filtrados por impacto):
+{noticias_hoy}
 
-1. Un driver clave del día en el Mundo (tasas/commodities).
-2. Un driver clave del día en Argentina (fx/bonos).
+REGLA DE ORO: Cero introducción, cero conclusiones genéricas, cero 'saraza'. NO repitas los números exactos que te pasé arriba. 
+Basándote en los datos y especialmente en la info de los TITULARES, escribí 3 viñetas crudas y objetivas (máximo 2 oraciones cada una):
+
+1. Un driver clave del día en el Mundo (tasas/commodities/USA).
+2. Un driver clave del día en Argentina (usando la info de los titulares).
 3. Dato crítico a mirar mañana.
 """
 url_ai = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={GEMINI_API_KEY}"
 try:
     res = requests.post(url_ai, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=20)
-    res.raise_for_status() # Fuerza a que nos diga si hay error
+    res.raise_for_status()
     texto_ia = res.json()['candidates'][0]['content']['parts'][0]['text']
     
-    # MATRIZ CORREGIDA: Creamos el DataFrame como diccionario para que Google Sheets no se maree
     df_ai = pd.DataFrame({
         "Fecha": [hoy.strftime('%d/%m/%Y')],
         "Analisis_LLM": [texto_ia]
@@ -185,6 +228,5 @@ try:
     print("✅ IA Finalizada y guardada en Sheets.")
 except Exception as e:
     print(f"⚠️ Error crítico en IA: {e}")
-    if 'res' in locals(): print(res.text)
 
 print("🏁 Pipeline completado con éxito.")
