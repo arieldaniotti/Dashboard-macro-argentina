@@ -166,8 +166,10 @@ def aplicar_estilo_bloomberg(fig):
 # ==========================================
 # 4. SOLAPAS (TABS)
 # ==========================================
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["📌 Resumen", "🌎 Macro Global", "🇦🇷 Argentina", "🏗️ Inmobiliario", "💼 Portafolio"])
+# 🌟 AGREGAMOS LA NUEVA PESTAÑA DE FUTUROS ("🔮 Expectativas")
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📌 Resumen", "🌎 Macro Global", "🇦🇷 Argentina", "🔮 Expectativas", "🏗️ Inmobiliario", "💼 Portafolio"])
 
+# --- TAB 1: RESUMEN ---
 with tab1:
     st.subheader("Panorama de Mercado")
     c1, c2, c3, c4 = st.columns(4)
@@ -185,7 +187,6 @@ with tab1:
 
     st.markdown("<br>", unsafe_allow_html=True)
     col_fg, col_ia = st.columns([1, 3])
-    
     with col_fg:
         color_fg = "#ef4444" if "Fear" in fng_class else "#10b981" if "Greed" in fng_class else "#f59e0b"
         st.markdown(f"""
@@ -195,7 +196,6 @@ with tab1:
             <div style="color: {color_fg}; font-weight: bold; font-size: 14px;">{fng_class.upper()}</div>
         </div>
         """, unsafe_allow_html=True)
-
     with col_ia:
         if not df_insights.empty:
             texto_ia = str(df_insights['Analisis_LLM'].iloc[-1]).replace(chr(10), '<br>')
@@ -206,6 +206,7 @@ with tab1:
                 </div>
             """, unsafe_allow_html=True)
 
+# --- TAB 2: MACRO GLOBAL ---
 with tab2:
     st.subheader("Contexto Internacional y Tasas")
     col1, col2 = st.columns(2)
@@ -218,7 +219,6 @@ with tab2:
                 fig_tasas = px.line(df_macro, x='fecha', y=tasas_cols, template='plotly_dark', color_discrete_sequence=['#38bdf8', '#34d399'])
                 st.plotly_chart(aplicar_estilo_bloomberg(fig_tasas), use_container_width=True)
             else: st.info("Datos no disponibles.")
-                
         with col2:
             st.markdown("**Yield Curve (10Y - 2Y)**")
             if 'T10Y2Y' in df_macro.columns:
@@ -228,6 +228,7 @@ with tab2:
                 st.plotly_chart(aplicar_estilo_bloomberg(fig_yield), use_container_width=True)
             else: st.info("Datos no disponibles.")
 
+# --- TAB 3: ARGENTINA ---
 with tab3:
     st.subheader("Variables Monetarias Locales")
     if not df_hist.empty:
@@ -239,10 +240,42 @@ with tab3:
             st.plotly_chart(aplicar_estilo_bloomberg(fig_usd), use_container_width=True)
         else: st.info("Datos no disponibles.")
 
+# --- TAB 4: EXPECTATIVAS Y FUTUROS (NUEVO DISEÑO MINIMALISTA) ---
 with tab4:
+    st.subheader("Curvas de Futuros y Expectativas (REM)")
+    st.caption("Maqueta visual: Datos fijos de demostración. Sin gráficos, foco en tasas implícitas.")
+    
+    st.markdown("### Dólar Futuro (Matba Rofex)")
+    col1, col2, col3, col4 = st.columns(4)
+    # Ejemplo de cómo se vería una tarjeta de futuros sin gráficos
+    def render_future_card(contrato, precio, tna, delta_precio):
+        color = "color: #10b981;" if delta_precio < 0 else "color: #ef4444;" # Si el dolar futuro sube, es alerta roja
+        st.markdown(f"""
+        <div class="metric-card" style="padding: 15px;">
+            <div style="font-size: 14px; color: #94a3b8; font-weight: bold; text-transform: uppercase;">{contrato}</div>
+            <div style="font-size: 24px; color: #f8fafc; font-weight: bold; font-family: monospace; margin: 8px 0;">$ {precio}</div>
+            <div style="display: flex; justify-content: space-between; font-size: 14px; border-top: 1px solid #1e293b; padding-top: 8px;">
+                <span style="color: #38bdf8; font-weight: bold;">TNA: {tna}%</span>
+                <span style="{color} font-weight: bold;">{delta_precio}% 1D</span>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with col1: render_future_card("Fin Mes Actual", "1.415,50", "45.2", 0.15)
+    with col2: render_future_card("Fin Próximo Mes", "1.468,20", "48.5", -0.05)
+    with col3: render_future_card("Diciembre", "1.750,00", "52.1", 1.20)
+    
+    st.markdown("<br>### Inflación Esperada (REM BCRA)", unsafe_allow_html=True)
+    col5, col6, col7, col8 = st.columns(4)
+    with col5: render_future_card("IPC Mes Próximo", "4.5", "-", -0.2) # En inflación, bajar es verde
+    with col6: render_future_card("IPC 12 Meses", "65.0", "-", -2.5)
+
+# --- TAB 5: INMOBILIARIO ---
+with tab5:
     st.subheader("Mercado Inmobiliario")
     st.info("💡 Espacio reservado para el módulo de Real Estate.")
 
-with tab5:
+# --- TAB 6: PORTAFOLIO ---
+with tab6:
     st.subheader("Portafolio de Inversión")
     st.info("💡 Espacio reservado para Asset Allocation.")
