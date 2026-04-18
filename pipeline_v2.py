@@ -161,16 +161,14 @@ write_ws(sh, "DB_Macro", df_macro_sheet)
 # ==========================================
 print("🧠 Generando análisis IA...")
 prompt = f"""
-Sos el Estratega Jefe de un fondo de inversión top tier. Hoy es {hoy.strftime('%d/%m/%Y')}. 
-El mercado cerró con el S&P en {df_final['SP500'].iloc[-1]}, Brent en {df_final['Brent'].iloc[-1]}, Oro en {df_final['Oro'].iloc[-1]}, Riesgo País ARG en {df_final['Riesgo_Pais'].iloc[-1]} y Brecha Cambiaria en {df_final['Brecha_CCL'].iloc[-1]}%.
+Sos un Trader de Mesa institucional. Hoy es {hoy.strftime('%d/%m/%Y')}. 
+Datos: S&P en {df_final['SP500'].iloc[-1]}, Brent en {df_final['Brent'].iloc[-1]}, Riesgo País ARG en {df_final['Riesgo_Pais'].iloc[-1]} y Brecha Cambiaria en {df_final['Brecha_CCL'].iloc[-1]}%.
 
-REGLA DE ORO 1: NO repitas los números crudos en el texto, el cliente ya los está viendo en el tablero.
-REGLA DE ORO 2: Tu trabajo es INTERPRETAR el por qué de los movimientos.
+REGLA DE ORO: Cero introducción, cero conclusiones genéricas, cero 'saraza'. NO repitas los números exactos. Escribí 3 viñetas crudas y objetivas (máximo 2 oraciones cada una):
 
-Redactá un "Flash de Mercado" de 3 párrafos cortos (Estilo Bloomberg/Wall Street Journal, tono sofisticado, crudo y directo, sin formato markdown ni negritas):
-1. Panorama Global: Analizá los drivers detrás del mercado de hoy. Relacioná los movimientos del S&P, Oro y Petróleo con el contexto geopolítico actual (riesgos de escaladas bélicas, Medio Oriente o Europa) y las expectativas de tasas de la FED.
-2. Panorama Argentina: Analizá la coyuntura local. Explicá qué significa el nivel actual del Riesgo País y la Brecha Cambiaria en relación a la política fiscal del gobierno, el cepo cambiario y la dinámica de reservas del BCRA.
-3. Proyección/Alerta: Una frase final contundente sobre qué variable macro o geopolítica vigilar de cerca mañana.
+1. Un driver clave del día en el Mundo (tasas/commodities).
+2. Un driver clave del día en Argentina (fx/bonos).
+3. Dato crítico a mirar mañana.
 """
 url_ai = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={GEMINI_API_KEY}"
 try:
