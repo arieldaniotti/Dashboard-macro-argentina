@@ -5,7 +5,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta
 
-print("🚀 Iniciando Pipeline V12 (Macro Completa + IA Segmentada)...")
+print("🚀 Iniciando Pipeline V13 (Fijando datos faltantes)...")
 
 # --- CONFIG ---
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
@@ -35,13 +35,11 @@ df_ripte = pd.DataFrame(fetch("https://api.argentinadatos.com/v1/finanzas/indice
 for df in [df_oficial, df_blue, df_rp, df_ipc, df_emae, df_ripte]:
     if not df.empty: df["fecha"] = pd.to_datetime(df["fecha"])
 
-# --- 2. CÁLCULO DE BENCHMARKS Y VARIACIONES ---
+# --- 2. CÁLCULO DE BENCHMARKS ---
 def get_bench(months):
     try:
-        # Inflación acumulada en el periodo
         ipc_history = df_ipc['IPC'].tail(months).astype(float) / 100
         ipc_acc = (1 + ipc_history).prod() - 1
-        # Devaluación
         u_hoy = df_oficial['USD_Oficial'].iloc[-1]
         u_ant = df_oficial[df_oficial['fecha'] <= (hoy - timedelta(days=30*months))].iloc[-1]['USD_Oficial']
         dev = (u_hoy / u_ant) - 1
@@ -52,8 +50,9 @@ bench_1m = get_bench(1)
 bench_1a = get_bench(12)
 
 # --- 3. MERCADO ---
-print("📈 Descargando tickers...")
-tickers = {"SP500":"^GSPC", "Merval":"^MERV", "BTC":"BTC-USD", "AL30":"AL30.BA", "GGAL_ADR":"GGAL", "GGAL_LOC":"GGAL.BA"}
+print("📈 Descargando tickers globales y locales...")
+# FIX: Volvieron el Oro y el Brent a la lista de descargas
+tickers = {"SP500":"^GSPC", "Merval":"^MERV", "BTC":"BTC-USD", "Oro":"GC=F", "Brent":"BZ=F", "AL30":"AL30.BA", "GGAL_ADR":"GGAL", "GGAL_LOC":"GGAL.BA"}
 df_m = pd.DataFrame()
 for c, t in tickers.items():
     try:
@@ -69,10 +68,21 @@ if not df_m.empty:
 df_final = df_m.copy()
 for df_extra in [df_oficial, df_blue, df_rp, df_ipc, df_emae, df_ripte]:
     if not df_extra.empty:
-        df_final = df_final.merge(df_extra, on="fecha", how="outer").ffill()
+        df_final = df_final.merge(df_extra, on="fecha", how="outer")
 
-df_final["CCL"] = (df_final["GGAL_LOC"] / (df_final["GGAL_ADR"] / 10)).round(2)
-df_final["Brecha_CCL"] = (((df_final["CCL"] / df_final["USD_Oficial"]) - 1) * 100).round(2)
+# FIX: Ordenar por fecha ANTES de rellenar los vacíos (vital para EMAE y RIPTE)
+df_final = df_final.sort_values("fecha").ffill()
+
+# Seguro por si la API de ArgentinaDatos se cae un día, para que no rompa el dashboard
+for col in ["Oro", "Brent", "EMAE", "RIPTE", "IPC"]:
+    if col not in df_final.columns:
+        df_final[col] = pd.NA
+
+if "GGAL_LOC" in df_final.columns and "GGAL_ADR" in df_final.columns:
+    df_final["CCL"] = (df_final["GGAL_LOC"] / (df_final["GGAL_ADR"] / 10)).round(2)
+    if "USD_Oficial" in df_final.columns:
+        df_final["Brecha_CCL"] = (((df_final["CCL"] / df_final["USD_Oficial"]) - 1) * 100).round(2)
+
 df_final = df_final.dropna(subset=["SP500"])
 
 def write_ws(name, df):
@@ -82,19 +92,21 @@ def write_ws(name, df):
 
 write_ws("DB_Historico", df_final)
 
-# --- 5. IA FLASH MARKET (Ultra Corto) ---
+# --- 5. IA FLASH MARKET ---
 print("🧠 IA Generando reportes...")
 prompt = f"""
 Sos un Trader. Hoy es {hoy.strftime('%d/%m/%Y')}. 
 1. Escribí un FLASH MARKET de máximo 3 items cortos (Mundo, Arg, Mañana).
 2. Agregá un separador '---'.
-3. Escribí un párrafo titulado '💡 EL DATO REAL:' explicando que el país se encareció un {bench_1m}% en dólares este mes. Sé muy didáctico para 'Doña Rosa'.
+3. Escribí un párrafo titulado '💡 EL DATO REAL:' explicando que el país se encareció/abarató un {bench_1m}% en dólares este mes. Sé muy didáctico para 'Doña Rosa'.
 """
 url_ia = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={GEMINI_API_KEY}"
-res = requests.post(url_ia, json={"contents": [{"parts": [{"text": prompt}]}]}).json()
-texto_ia = res['candidates'][0]['content']['parts'][0]['text']
+try:
+    res = requests.post(url_ia, json={"contents": [{"parts": [{"text": prompt}]}]}).json()
+    texto_ia = res['candidates'][0]['content']['parts'][0]['text']
+except: texto_ia = "Error LLM --- 💡 EL DATO REAL: Hubo un problema al cargar el análisis."
 
 df_insights = pd.DataFrame({"Analisis_LLM": [texto_ia], "Bench_1M": [bench_1m], "Bench_1A": [bench_1a]})
 write_ws("DB_Insights", df_insights)
 
-print("🏁 Pipeline V12 Finalizado.")
+print("🏁 Pipeline V13 Finalizado.")
