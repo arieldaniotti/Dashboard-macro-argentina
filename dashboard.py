@@ -7,9 +7,6 @@ import plotly.graph_objects as go
 import requests
 from datetime import timedelta
 
-# ==========================================
-# 1. CONFIGURACIÓN Y ESTILOS
-# ==========================================
 st.set_page_config(page_title="Terminal Macro", layout="wide", initial_sidebar_state="collapsed")
 st.markdown("""
     <style>
@@ -25,9 +22,6 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# ==========================================
-# 2. CONEXIÓN A DATOS
-# ==========================================
 @st.cache_data(ttl=600)
 def load_all():
     scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
@@ -36,6 +30,7 @@ def load_all():
     def read(n):
         try:
             data = sh.worksheet(n).get_all_values()
+            if len(data) <= 1: return pd.DataFrame()
             df = pd.DataFrame(data[1:], columns=data[0])
             if 'fecha' in df.columns: df['fecha'] = pd.to_datetime(df['fecha'], errors='coerce')
             return df
@@ -65,23 +60,23 @@ def aplicar_estilo_bloomberg(fig):
     fig.update_traces(line=dict(width=2.5))
     return fig
 
-# --- FUNCIÓN BLINDADA ANTI-FERIADOS ---
 def render_kpi(title, col, prefix="", suffix="", is_inverted=False, is_macro=False):
     try:
         if col not in df_hist.columns:
-            st.error(f"No hay datos de {col}")
+            st.error(f"Faltan datos: {col}")
             return
             
-        df = df_hist[['fecha', col]].dropna()
-        if df.empty:
-            st.error(f"Tabla vacía para {col}")
-            return
-            
+        df = df_hist[['fecha', col]].copy()
         df[col] = pd.to_numeric(df[col], errors='coerce')
+        df = df.dropna(subset=[col])
+        
+        if df.empty:
+            st.error(f"Sin registros válidos para {col}")
+            return
+            
         val = df[col].iloc[-1]
         last_date = df['fecha'].iloc[-1]
         
-        # Filtros de fecha seguros
         df_1m = df[df['fecha'] <= (last_date - timedelta(days=30))]
         ant_1m = df_1m.iloc[-1][col] if not df_1m.empty else df[col].iloc[0]
         
@@ -115,15 +110,12 @@ def render_kpi(title, col, prefix="", suffix="", is_inverted=False, is_macro=Fal
             d1 = (val - val_1d) if is_points else ((val/val_1d)-1)*100 if val_1d else 0
             fmt_d = f"{d1:+.1f}bps" if is_points and col == 'Riesgo_Pais' else f"{d1:+.1f}%"
             st.markdown(f'<div class="metric-card"><div class="m-title">{title}</div><div class="m-val">{prefix}{val_str}{suffix}</div><div class="m-deltas"><span>1D: <span class="{get_clr(d1)}">{fmt_d}</span></span><span>1M: <span class="{get_clr(m1)}">{fmt_m}</span></span><span>1A: <span class="{get_clr(y1)}">{fmt_y}</span></span></div></div>', unsafe_allow_html=True)
-    except: st.error(f"Error renderizando {col}")
+    except: st.error(f"Error {col}")
 
-# ==========================================
-# 3. INTERFAZ TABS
-# ==========================================
+# --- TABS ---
 st.title("📊 Dashboard Económico Financiero")
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📌 Resumen", "🌎 Macro Global", "🇦🇷 AR Estrategia", "🔮 Expectativas", "🏗️ Inmobiliario", "💼 Portafolio"])
 
-# --- TAB 1: RESUMEN ---
 with tab1:
     st.markdown('<div class="section-title">🌐 MUNDO</div>', unsafe_allow_html=True)
     c1, c2, c3, c4 = st.columns(4)
@@ -158,7 +150,6 @@ with tab1:
             flash_txt = txt_full.split("💡 EL DATO REAL:")[0].replace("---", "") if "💡 EL DATO REAL:" in txt_full else txt_full
             st.markdown(f'<div class="ai-box"><div style="color:#38bdf8;font-weight:bold;margin-bottom:10px;font-size:14px;">🤖 FLASH MARKET</div><div style="font-size:14px;color:#cbd5e1;line-height:1.6;">{flash_txt}</div></div>', unsafe_allow_html=True)
 
-# --- TAB 2: MACRO GLOBAL ---
 with tab2:
     st.subheader("Contexto Internacional y Tasas")
     col1, col2 = st.columns(2)
@@ -178,7 +169,6 @@ with tab2:
                 fig_yield.update_traces(fillcolor='rgba(245, 158, 11, 0.2)', line=dict(width=2)) 
                 st.plotly_chart(aplicar_estilo_bloomberg(fig_yield), use_container_width=True)
 
-# --- TAB 3: ARGENTINA ESTRATEGIA ---
 with tab3:
     st.markdown('<div class="section-title">🇦🇷 SEMÁFORO MACROECONÓMICO</div>', unsafe_allow_html=True)
     c1, c2, c3 = st.columns(3)
@@ -190,25 +180,23 @@ with tab3:
     intervalo = st.radio("Seleccionar Intervalo:", ["Mensual", "Anual"], horizontal=True)
     bench = float(df_ai['Bench_1M' if intervalo=="Mensual" else 'Bench_1A'].iloc[-1]) if not df_ai.empty else -4.3
 
-    # --- CÁLCULO BLINDADO DE RETORNO REAL ---
     def get_real_ret(col, es_pesos=False):
         try:
-            df = df_hist[['fecha', col, 'CCL']].dropna()
+            df = df_hist[['fecha', col, 'CCL']].copy()
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+            df['CCL'] = pd.to_numeric(df['CCL'], errors='coerce')
+            df = df.dropna(subset=[col, 'CCL'])
+            
             if df.empty: return 0.0
             
-            v_h = pd.to_numeric(df[col]).iloc[-1]
-            ccl_h = pd.to_numeric(df['CCL']).iloc[-1]
+            v_h, ccl_h = df[col].iloc[-1], df['CCL'].iloc[-1]
             last_date = df['fecha'].iloc[-1]
             
-            # Buscamos la fecha límite y agarramos el dato, si está vacío vamos al dato más viejo.
             df_a = df[df['fecha'] <= (last_date - timedelta(days=30 if intervalo=="Mensual" else 365))]
-            
             if df_a.empty:
-                v_a = pd.to_numeric(df[col]).iloc[0]
-                ccl_a = pd.to_numeric(df['CCL']).iloc[0]
+                v_a, ccl_a = df[col].iloc[0], df['CCL'].iloc[0]
             else:
-                v_a = pd.to_numeric(df_a[col]).iloc[-1]
-                ccl_a = pd.to_numeric(df_a['CCL']).iloc[-1]
+                v_a, ccl_a = df_a[col].iloc[-1], df_a['CCL'].iloc[-1]
                 
             usd_h = v_h/ccl_h if es_pesos else v_h
             usd_a = v_a/ccl_a if es_pesos else v_a
@@ -247,9 +235,8 @@ with tab3:
 
     if not df_ai.empty and "💡 EL DATO REAL:" in str(df_ai["Analisis_LLM"].iloc[-1]):
         txt_dona = str(df_ai["Analisis_LLM"].iloc[-1]).split("💡 EL DATO REAL:")[1].strip()
-        st.markdown(f'<div class="ai-box" style="margin-top:20px;"><div style="color:#38bdf8;font-weight:bold;margin-bottom:10px;font-size:14px;">💡 LA EXPLICACIÓN (DOÑA ROSA)</div><div style="font-size:15px;color:#cbd5e1;line-height:1.6;">{txt_dona}</div></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="ai-box" style="margin-top:20px;"><div style="color:#38bdf8;font-weight:bold;margin-bottom:10px;font-size:14px;">💡 LA EXPLICACIÓN</div><div style="font-size:15px;color:#cbd5e1;line-height:1.6;">{txt_dona}</div></div>', unsafe_allow_html=True)
 
-# --- TAB 4: EXPECTATIVAS ---
 with tab4:
     st.subheader("Curvas de Futuros y Expectativas (REM)")
     st.caption("Datos implícitos Matba Rofex.")
