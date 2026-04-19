@@ -65,14 +65,28 @@ def aplicar_estilo_bloomberg(fig):
     fig.update_traces(line=dict(width=2.5))
     return fig
 
+# --- FUNCIÓN BLINDADA ANTI-FERIADOS ---
 def render_kpi(title, col, prefix="", suffix="", is_inverted=False, is_macro=False):
     try:
+        if col not in df_hist.columns:
+            st.error(f"No hay datos de {col}")
+            return
+            
         df = df_hist[['fecha', col]].dropna()
-        df[col] = pd.to_numeric(df[col])
+        if df.empty:
+            st.error(f"Tabla vacía para {col}")
+            return
+            
+        df[col] = pd.to_numeric(df[col], errors='coerce')
         val = df[col].iloc[-1]
+        last_date = df['fecha'].iloc[-1]
         
-        ant_1m = df[df['fecha'] <= (df['fecha'].iloc[-1] - timedelta(days=30))].iloc[-1][col]
-        ant_1a = df[df['fecha'] <= (df['fecha'].iloc[-1] - timedelta(days=365))].iloc[-1][col]
+        # Filtros de fecha seguros
+        df_1m = df[df['fecha'] <= (last_date - timedelta(days=30))]
+        ant_1m = df_1m.iloc[-1][col] if not df_1m.empty else df[col].iloc[0]
+        
+        df_1a = df[df['fecha'] <= (last_date - timedelta(days=365))]
+        ant_1a = df_1a.iloc[-1][col] if not df_1a.empty else df[col].iloc[0]
         
         is_points = col in ['Riesgo_Pais', 'Brecha_CCL']
         
@@ -80,8 +94,8 @@ def render_kpi(title, col, prefix="", suffix="", is_inverted=False, is_macro=Fal
             m1 = val - ant_1m
             y1 = val - ant_1a
         else:
-            m1 = ((val/ant_1m)-1)*100
-            y1 = ((val/ant_1a)-1)*100
+            m1 = ((val/ant_1m)-1)*100 if ant_1m else 0
+            y1 = ((val/ant_1a)-1)*100 if ant_1a else 0
 
         def get_clr(d):
             if abs(d) < 0.05: return "d-flat"
@@ -98,10 +112,10 @@ def render_kpi(title, col, prefix="", suffix="", is_inverted=False, is_macro=Fal
             st.markdown(f'<div class="metric-card"><div class="m-title">{title}</div><div class="m-val">{prefix}{val_str}{suffix}</div><div class="m-deltas"><span>1M: <span class="{get_clr(m1)}">{fmt_m}</span></span><span>1A: <span class="{get_clr(y1)}">{fmt_y}</span></span></div></div>', unsafe_allow_html=True)
         else:
             val_1d = df[col].iloc[-2] if len(df)>1 else val
-            d1 = (val - val_1d) if is_points else ((val/val_1d)-1)*100
+            d1 = (val - val_1d) if is_points else ((val/val_1d)-1)*100 if val_1d else 0
             fmt_d = f"{d1:+.1f}bps" if is_points and col == 'Riesgo_Pais' else f"{d1:+.1f}%"
             st.markdown(f'<div class="metric-card"><div class="m-title">{title}</div><div class="m-val">{prefix}{val_str}{suffix}</div><div class="m-deltas"><span>1D: <span class="{get_clr(d1)}">{fmt_d}</span></span><span>1M: <span class="{get_clr(m1)}">{fmt_m}</span></span><span>1A: <span class="{get_clr(y1)}">{fmt_y}</span></span></div></div>', unsafe_allow_html=True)
-    except: st.error(f"Error {col}")
+    except: st.error(f"Error renderizando {col}")
 
 # ==========================================
 # 3. INTERFAZ TABS
@@ -144,7 +158,7 @@ with tab1:
             flash_txt = txt_full.split("💡 EL DATO REAL:")[0].replace("---", "") if "💡 EL DATO REAL:" in txt_full else txt_full
             st.markdown(f'<div class="ai-box"><div style="color:#38bdf8;font-weight:bold;margin-bottom:10px;font-size:14px;">🤖 FLASH MARKET</div><div style="font-size:14px;color:#cbd5e1;line-height:1.6;">{flash_txt}</div></div>', unsafe_allow_html=True)
 
-# --- TAB 2: MACRO GLOBAL (Restaurado) ---
+# --- TAB 2: MACRO GLOBAL ---
 with tab2:
     st.subheader("Contexto Internacional y Tasas")
     col1, col2 = st.columns(2)
@@ -169,22 +183,36 @@ with tab3:
     st.markdown('<div class="section-title">🇦🇷 SEMÁFORO MACROECONÓMICO</div>', unsafe_allow_html=True)
     c1, c2, c3 = st.columns(3)
     with c1: render_kpi("Inflación (IPC Últ. Mes)", "IPC", suffix="%", is_macro=True)
-    with c2: render_kpi("Actividad (EMAE)", "EMAE", is_macro=True)
+    with c2: render_kpi("Actividad (EMAE)", "EMAE", suffix=" pts", is_macro=True)
     with c3: render_kpi("Salario (RIPTE)", "RIPTE", prefix="$", is_macro=True)
 
     st.markdown('<div class="section-title">🔍 ANÁLISIS DE VALOR REAL (BASE USD)</div>', unsafe_allow_html=True)
     intervalo = st.radio("Seleccionar Intervalo:", ["Mensual", "Anual"], horizontal=True)
     bench = float(df_ai['Bench_1M' if intervalo=="Mensual" else 'Bench_1A'].iloc[-1]) if not df_ai.empty else -4.3
 
+    # --- CÁLCULO BLINDADO DE RETORNO REAL ---
     def get_real_ret(col, es_pesos=False):
         try:
             df = df_hist[['fecha', col, 'CCL']].dropna()
-            v_h, ccl_h = pd.to_numeric(df[col]).iloc[-1], pd.to_numeric(df['CCL']).iloc[-1]
-            df_a = df[df['fecha'] <= (df['fecha'].iloc[-1] - timedelta(days=30 if intervalo=="Mensual" else 365))]
-            if df_a.empty: return 0.0
-            v_a, ccl_a = pd.to_numeric(df_a[col]).iloc[-1], pd.to_numeric(df_a['CCL']).iloc[-1]
+            if df.empty: return 0.0
+            
+            v_h = pd.to_numeric(df[col]).iloc[-1]
+            ccl_h = pd.to_numeric(df['CCL']).iloc[-1]
+            last_date = df['fecha'].iloc[-1]
+            
+            # Buscamos la fecha límite y agarramos el dato, si está vacío vamos al dato más viejo.
+            df_a = df[df['fecha'] <= (last_date - timedelta(days=30 if intervalo=="Mensual" else 365))]
+            
+            if df_a.empty:
+                v_a = pd.to_numeric(df[col]).iloc[0]
+                ccl_a = pd.to_numeric(df['CCL']).iloc[0]
+            else:
+                v_a = pd.to_numeric(df_a[col]).iloc[-1]
+                ccl_a = pd.to_numeric(df_a['CCL']).iloc[-1]
+                
             usd_h = v_h/ccl_h if es_pesos else v_h
             usd_a = v_a/ccl_a if es_pesos else v_a
+            
             return ((usd_h/usd_a)-1)*100
         except: return 0.0
 
@@ -221,7 +249,7 @@ with tab3:
         txt_dona = str(df_ai["Analisis_LLM"].iloc[-1]).split("💡 EL DATO REAL:")[1].strip()
         st.markdown(f'<div class="ai-box" style="margin-top:20px;"><div style="color:#38bdf8;font-weight:bold;margin-bottom:10px;font-size:14px;">💡 LA EXPLICACIÓN (DOÑA ROSA)</div><div style="font-size:15px;color:#cbd5e1;line-height:1.6;">{txt_dona}</div></div>', unsafe_allow_html=True)
 
-# --- TAB 4: EXPECTATIVAS (Restaurado) ---
+# --- TAB 4: EXPECTATIVAS ---
 with tab4:
     st.subheader("Curvas de Futuros y Expectativas (REM)")
     st.caption("Datos implícitos Matba Rofex.")
