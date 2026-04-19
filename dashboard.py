@@ -161,14 +161,14 @@ with tab1:
             flash_txt = txt_full.split("💡 EL DATO REAL:")[0] if "💡 EL DATO REAL:" in txt_full else txt_full
             st.markdown(f'<div class="ai-box"><div class="ai-title">🤖 FLASH MARKET</div><div class="ai-text">{flash_txt}</div></div>', unsafe_allow_html=True)
 
-# --- TAB 2: MACRO GLOBAL (Con función arreglada) ---
+# --- TAB 2: MACRO GLOBAL ---
 with tab2:
     st.subheader("Contexto Internacional y Tasas")
     col1, col2 = st.columns(2)
     with col1:
         st.markdown("**Evolución Tasas (Demo)**")
-        # Gráfico mock up visual hasta conectar la data
-        df_mock = pd.DataFrame({'fecha': pd.date_range(start='1/1/2023', periods=12, freq='M'), 'FED': [4,4.5,4.7,5,5.2,5.5,5.5,5.5,5.5,5.5,5.5,5.5]})
+        # ¡Acá está el fix! Cambié freq='M' por freq='ME'
+        df_mock = pd.DataFrame({'fecha': pd.date_range(start='1/1/2023', periods=12, freq='ME'), 'FED': [4,4.5,4.7,5,5.2,5.5,5.5,5.5,5.5,5.5,5.5,5.5]})
         fig_tasas = px.line(df_mock, x='fecha', y='FED', template='plotly_dark', color_discrete_sequence=['#38bdf8'])
         st.plotly_chart(aplicar_estilo_bloomberg(fig_tasas), use_container_width=True)
 
@@ -193,7 +193,6 @@ with tab3:
     try: bench_val = float(df_ai['Bench_1M' if intervalo == "Mensual" else 'Bench_1A'].iloc[-1])
     except: bench_val = -4.3 if intervalo == "Mensual" else 15.0
 
-    # FIX DE DATOS: Aseguramos encontrar el precio anterior o ir al inicio de la tabla
     def calc_retorno_usd(columna, es_pesos=False):
         try:
             df = df_hist[['fecha', columna, 'CCL']].dropna()
