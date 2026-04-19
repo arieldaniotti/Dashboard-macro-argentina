@@ -1,9 +1,8 @@
-streamlit
-pandas
-plotly
-gspread
-google-auth
-yfinance
-requests
-pandas-datareader
-feedparser
+requests>=2.31.0
+feedparser>=6.0.10
+yfinance>=0.2.40
+pandas>=2.1.0
+gspread>=6.0.0
+google-auth>=2.27.0
+streamlit>=1.30.0
+plotly>=5.18.0
