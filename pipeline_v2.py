@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 
 print("=" * 60)
-print("Pipeline V20 - Arquitectura Completa Restaurada")
+print("Pipeline V21 - Fix Sintaxis JSON")
 print(f"Fecha corrida: {datetime.now(timezone.utc).isoformat()}")
 print("=" * 60)
 
@@ -28,15 +28,14 @@ if not GEMINI_API_KEY or not GCP_JSON:
 creds = Credentials.from_service_account_info(
     json.loads(GCP_JSON),
     scopes=[
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
+        "[https://www.googleapis.com/auth/spreadsheets](https://www.googleapis.com/auth/spreadsheets)",
+        "[https://www.googleapis.com/auth/drive](https://www.googleapis.com/auth/drive)",
     ],
 )
 sh = gspread.authorize(creds).open("Dashboard Macro")
 
 HOY = datetime.today()
 HACE_1A = HOY - timedelta(days=365)
-
 
 # ---------------------------------------------------------------
 # HELPERS
@@ -75,19 +74,18 @@ def get_historical_value(df, col, days_back):
         return prev[col].iloc[-1] if not prev.empty else serie[col].iloc[0]
     except Exception: return None
 
-
 # ---------------------------------------------------------------
 # 1. DATOS MACRO (argentinadatos.com para evitar bloqueos)
 # ---------------------------------------------------------------
 print("\n[1/8] Ingesta macro Argentina...")
 
 endpoints_argdatos = {
-    "oficial": ("https://api.argentinadatos.com/v1/cotizaciones/dolares/oficial", "venta", "USD_Oficial"),
-    "blue": ("https://api.argentinadatos.com/v1/cotizaciones/dolares/blue", "venta", "USD_Blue"),
-    "rp": ("https://api.argentinadatos.com/v1/finanzas/indices/riesgo-pais", "valor", "Riesgo_Pais"),
-    "ipc": ("https://api.argentinadatos.com/v1/finanzas/indices/inflacion", "valor", "IPC"),
-    "emae": ("https://api.argentinadatos.com/v1/finanzas/indices/emae", "valor", "EMAE"),
-    "salarios": ("https://api.argentinadatos.com/v1/finanzas/indices/ripte", "valor", "IndiceSalarios") # RIPTE usado como proxy de IndiceSalarios
+    "oficial": ("[https://api.argentinadatos.com/v1/cotizaciones/dolares/oficial](https://api.argentinadatos.com/v1/cotizaciones/dolares/oficial)", "venta", "USD_Oficial"),
+    "blue": ("[https://api.argentinadatos.com/v1/cotizaciones/dolares/blue](https://api.argentinadatos.com/v1/cotizaciones/dolares/blue)", "venta", "USD_Blue"),
+    "rp": ("[https://api.argentinadatos.com/v1/finanzas/indices/riesgo-pais](https://api.argentinadatos.com/v1/finanzas/indices/riesgo-pais)", "valor", "Riesgo_Pais"),
+    "ipc": ("[https://api.argentinadatos.com/v1/finanzas/indices/inflacion](https://api.argentinadatos.com/v1/finanzas/indices/inflacion)", "valor", "IPC"),
+    "emae": ("[https://api.argentinadatos.com/v1/finanzas/indices/emae](https://api.argentinadatos.com/v1/finanzas/indices/emae)", "valor", "EMAE"),
+    "salarios": ("[https://api.argentinadatos.com/v1/finanzas/indices/ripte](https://api.argentinadatos.com/v1/finanzas/indices/ripte)", "valor", "IndiceSalarios")
 }
 
 macro_dfs = {}
@@ -106,7 +104,6 @@ for key, (url, src_col, dest_col) in endpoints_argdatos.items():
 
 df_emae_raw = macro_dfs["emae"]
 df_salarios_raw = macro_dfs["salarios"]
-
 
 # ---------------------------------------------------------------
 # 3. IPC: métricas derivadas
@@ -143,7 +140,6 @@ ipc_yoy = ipc_interanual(df_ipc, 12) if not df_ipc.empty else None
 ipc_accel = ipc_aceleracion_pp(df_ipc) if not df_ipc.empty else None
 ipc_fechas_12m, ipc_valores_12m = ipc_serie_12m(df_ipc) if not df_ipc.empty else ([], [])
 
-
 # ---------------------------------------------------------------
 # 4. EMAE derivados
 # ---------------------------------------------------------------
@@ -167,7 +163,6 @@ if not df_emae_raw.empty:
     if not ant.empty:
         emae_yoy = round(pct_change(emae_val, ant["EMAE"].iloc[-1]), 2)
     emae_fechas_12m, emae_valores_12m = serie_12m(df_emae_raw, "EMAE")
-
 
 # ---------------------------------------------------------------
 # 5. SALARIO REAL
@@ -203,7 +198,6 @@ if not df_salarios_raw.empty and not df_ipc.empty:
             salario_real_yoy = round(salario_real_valores[-1] - 100, 2)
         salario_real_age_days = (pd.Timestamp.now() - df_salarios_raw["fecha"].iloc[-1]).days
 
-
 # ---------------------------------------------------------------
 # 6. BENCHMARK VALOR REAL USD
 # ---------------------------------------------------------------
@@ -227,7 +221,6 @@ def get_bench(months):
 
 bench_1m = get_bench(1)
 bench_1a = get_bench(12)
-
 
 # ---------------------------------------------------------------
 # 7. MERCADOS + CONSOLIDACIÓN
@@ -357,7 +350,7 @@ def parse_date_safe(entry):
         except Exception: pass
     return datetime.now()
 
-RSS_SOURCES = {"Ámbito": "https://www.ambito.com/rss/pages/economia.xml", "Infobae": "https://www.infobae.com/feeds/rss/economia/", "Cronista": "https://www.cronista.com/files/rss/economia.xml"}
+RSS_SOURCES = {"Ámbito": "[https://www.ambito.com/rss/pages/economia.xml](https://www.ambito.com/rss/pages/economia.xml)", "Infobae": "[https://www.infobae.com/feeds/rss/economia/](https://www.infobae.com/feeds/rss/economia/)", "Cronista": "[https://www.cronista.com/files/rss/economia.xml](https://www.cronista.com/files/rss/economia.xml)"}
 noticias = []
 for medio, url in RSS_SOURCES.items():
     try:
@@ -393,7 +386,7 @@ Devolvé UNICAMENTE este JSON válido:
 {{"lectura_macro": "Dos oraciones relacionando la actividad económica, los salarios y la inflación."}}"""
 
 def llamar_gemini(prompt):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    url = f"[https://generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/){GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
     payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.2}}
     for _ in range(3):
         try:
@@ -403,8 +396,69 @@ def llamar_gemini(prompt):
         except Exception: time.sleep(3)
     return None
 
+# MÉTODO SEGURO DE PARSEO SIN REGEX (Soluciona el SyntaxError)
 def parsear_json(texto):
     if not texto: return None
-    import re
-    limpio = re.sub(r"^
-http://googleusercontent.com/immersive_entry_chip/0
+    limpio = texto.strip()
+    if limpio.startswith("```json"):
+        limpio = limpio[7:]
+    elif limpio.startswith("```"):
+        limpio = limpio[3:]
+    if limpio.endswith("```"):
+        limpio = limpio[:-3]
+    try:
+        return json.loads(limpio.strip())
+    except Exception:
+        return None
+
+print("  → Llamadas a Gemini...")
+resp_resumen = parsear_json(llamar_gemini(build_prompt_resumen())) or {}
+resp_vr_1m = parsear_json(llamar_gemini(build_prompt_valor_real(valor_real_1m, bench_1m, "Mensual"))) or {}
+resp_vr_1a = parsear_json(llamar_gemini(build_prompt_valor_real(valor_real_1a, bench_1a, "Anual"))) or {}
+resp_macro = parsear_json(llamar_gemini(build_prompt_lectura_macro())) or {}
+
+# ---------------------------------------------------------------
+# ESCRITURA
+# ---------------------------------------------------------------
+print("\n[Escritura] Google Sheets...")
+def write_ws(name, df):
+    try:
+        ws = sh.worksheet(name)
+        ws.clear()
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=name, rows="1000", cols="30")
+    ws.update([df.columns.values.tolist()] + df.astype(str).values.tolist())
+
+df_out = df_final.fillna("")
+write_ws("DB_Historico", df_out)
+
+insights_df = pd.DataFrame({
+    "fecha_corrida": [HOY.isoformat()],
+    "mundo": [resp_resumen.get("mundo", "")],
+    "argentina": [resp_resumen.get("argentina", "")],
+    "a_mirar": [resp_resumen.get("a_mirar", "")],
+    "analisis_vr_1m": [resp_vr_1m.get("analisis", "")],
+    "analisis_vr_1a": [resp_vr_1a.get("analisis", "")],
+    "lectura_macro": [resp_macro.get("lectura_macro", "")],
+    "bench_1m": [bench_1m if bench_1m is not None else ""],
+    "bench_1a": [bench_1a if bench_1a is not None else ""],
+    "ipc_mes": [ipc_mes if ipc_mes is not None else ""],
+    "ipc_yoy": [ipc_yoy if ipc_yoy is not None else ""],
+    "ipc_accel_pp": [ipc_accel if ipc_accel is not None else ""],
+    "emae_val": [emae_val if emae_val is not None else ""],
+    "emae_yoy": [emae_yoy if emae_yoy is not None else ""],
+    "emae_age_days": [emae_age_days if emae_age_days is not None else ""],
+    "salario_real_yoy": [salario_real_yoy if salario_real_yoy is not None else ""],
+    "salario_real_age_days": [salario_real_age_days if salario_real_age_days is not None else ""],
+    "ipc_serie_json": [json.dumps({"fechas": ipc_fechas_12m, "valores": ipc_valores_12m}, ensure_ascii=False)],
+    "emae_serie_json": [json.dumps({"fechas": emae_fechas_12m, "valores": emae_valores_12m}, ensure_ascii=False)],
+    "salario_real_serie_json": [json.dumps({"fechas": salario_real_fechas, "valores": salario_real_valores}, ensure_ascii=False)],
+    "snapshots_json": [json.dumps(snapshots, ensure_ascii=False)],
+    "destacadas_json": [json.dumps(resp_resumen.get("noticias_destacadas", []), ensure_ascii=False)],
+    "valor_real_1m_json": [json.dumps(valor_real_1m, ensure_ascii=False)],
+    "valor_real_1a_json": [json.dumps(valor_real_1a, ensure_ascii=False)],
+}).fillna("")
+
+write_ws("DB_Insights", insights_df)
+
+print("Pipeline V21 - Completado con éxito.")
