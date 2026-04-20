@@ -1,3 +1,14 @@
+"""
+Dashboard V5 - Dashboard Económico Financiero Argentina
+
+Cambios vs V4:
+- Gráfico INTEGRADO dentro de cada card macro (no al costado)
+- Columna "Evaluación" con etiquetas semánticas:
+    * Inversiones: "Ganancia real fuerte" / "Supera inflación USD" / "Neutral" / "Pierde poder de compra" / "Pérdida real fuerte"
+    * Financiamiento: "Licuación fuerte" / "Licuación moderada" / "Costo neutro" / "Deuda cara en USD" / "Deuda muy cara"
+- SGR sigue en tabla de financiamiento (es deuda desde la óptica de la PyME emisora)
+"""
+
 import streamlit as st
 import pandas as pd
 import gspread
@@ -55,14 +66,6 @@ st.markdown("""
 .news-title a { color: #f8fafc; text-decoration: none; }
 .news-title a:hover { color: #38bdf8; }
 .news-why { font-size: 13px; color: #94a3b8; }
-.macro-big {
-    background: linear-gradient(135deg, #0b0e18 0%, #0f1420 100%);
-    border: 1px solid #1e293b; border-radius: 10px;
-    padding: 16px 18px; min-height: 140px;
-}
-.macro-label { font-size: 11px; color: #94a3b8; text-transform: uppercase; font-weight: 600; letter-spacing: 0.5px; }
-.macro-val { font-size: 28px; font-weight: 700; font-family: monospace; margin: 4px 0; color: #f8fafc; }
-.macro-delta { font-size: 12px; font-weight: 600; }
 .table-vr {
     width: 100%; border-collapse: collapse; font-size: 14px;
     background: #0b0e18; border-radius: 8px; overflow: hidden;
@@ -83,6 +86,15 @@ st.markdown("""
 .spread-good { background: rgba(16, 185, 129, 0.15); color: #10b981; }
 .spread-bad { background: rgba(239, 68, 68, 0.15); color: #ef4444; }
 .spread-flat { background: rgba(100, 116, 139, 0.15); color: #94a3b8; }
+.eval-tag {
+    font-size: 12px; font-weight: 500;
+    padding: 2px 8px; border-radius: 4px;
+}
+.eval-good-strong { color: #10b981; }
+.eval-good-mild { color: #34d399; }
+.eval-neutral { color: #94a3b8; }
+.eval-bad-mild { color: #f87171; }
+.eval-bad-strong { color: #ef4444; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -179,36 +191,38 @@ def color_class(delta, is_inverted=False):
 
 
 # -----------------------------------------------------------
-# SPARKLINE PLOTLY
+# ETIQUETAS SEMÁNTICAS PARA LA TABLA
 # -----------------------------------------------------------
-def sparkline(valores, color, height=50):
-    if not valores or len(valores) < 2:
-        return None
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        y=valores,
-        mode="lines",
-        line=dict(color=color, width=2),
-        fill="tozeroy",
-        fillcolor=color.replace("rgb", "rgba").replace(")", ", 0.15)") if color.startswith("rgb") else f"rgba{tuple(int(color.lstrip('#')[i:i+2], 16) for i in (0,2,4)) + (0.15,)}",
-        hoverinfo="skip",
-    ))
-    fig.update_layout(
-        margin=dict(l=0, r=0, t=0, b=0),
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        xaxis=dict(visible=False, fixedrange=True),
-        yaxis=dict(visible=False, fixedrange=True,
-                   range=[min(valores) - abs(min(valores)) * 0.05 - 0.5,
-                          max(valores) + abs(max(valores)) * 0.05 + 0.5]),
-        height=height,
-        showlegend=False,
-    )
-    return fig
+def etiqueta_inversion(spread):
+    """Clasifica el spread para inversiones."""
+    if spread > 10:
+        return ("Ganancia real fuerte", "eval-good-strong")
+    elif spread > 3:
+        return ("Supera inflación USD", "eval-good-mild")
+    elif spread > -3:
+        return ("Neutral", "eval-neutral")
+    elif spread > -10:
+        return ("Pierde poder de compra", "eval-bad-mild")
+    else:
+        return ("Pérdida real fuerte", "eval-bad-strong")
+
+
+def etiqueta_financiamiento(spread):
+    """Clasifica el spread para financiamiento (negativo = licuación)."""
+    if spread < -10:
+        return ("Licuación fuerte", "eval-good-strong")
+    elif spread < -3:
+        return ("Licuación moderada", "eval-good-mild")
+    elif spread < 3:
+        return ("Costo neutro", "eval-neutral")
+    elif spread < 10:
+        return ("Deuda cara en USD", "eval-bad-mild")
+    else:
+        return ("Deuda muy cara", "eval-bad-strong")
 
 
 # -----------------------------------------------------------
-# KPI RENDER (Resumen)
+# KPI RENDER (Resumen, no cambia)
 # -----------------------------------------------------------
 def render_kpi(title, col, prefix="", suffix="", is_inverted=False, mode="ratio"):
     try:
@@ -286,34 +300,94 @@ def render_kpi(title, col, prefix="", suffix="", is_inverted=False, mode="ratio"
 
 
 # -----------------------------------------------------------
-# MACRO CARD CON SPARKLINE
+# MACRO CARD CON GRÁFICO INTEGRADO (sparkline de fondo)
 # -----------------------------------------------------------
-def render_macro_card_with_sparkline(label, valor_str, subtexto, delta_text, delta_color,
-                                      serie_valores, color_hex, age_days=None):
+def macro_card_integrated(label, valor_str, subtexto, delta_text, delta_color,
+                           serie_valores, serie_fechas, color_hex,
+                           age_days=None, chart_type="line"):
     """
-    Card con 2 columnas: info a la izquierda, sparkline a la derecha.
+    Card única que tiene: label arriba, valor grande, subtexto,
+    gráfico al pie como visualización integrada del histórico 12m.
     """
     age_html = ""
     if age_days is not None and age_days > 45:
-        age_html = f'<div style="font-size:10px; color:#64748b; margin-top:2px;">Dato de hace {age_days}d</div>'
+        age_html = f'<div style="font-size:10px; color:#64748b; margin-top:3px;">Dato de hace {age_days}d</div>'
 
-    col_info, col_chart = st.columns([2, 1])
-    with col_info:
+    # Header de la card con la info numérica
+    st.markdown(
+        f'<div style="background: linear-gradient(135deg, #0b0e18 0%, #0f1420 100%);'
+        f' border: 1px solid #1e293b; border-radius: 10px 10px 0 0;'
+        f' padding: 14px 16px 8px 16px; border-bottom: none;">'
+        f'<div style="font-size:11px; color:#94a3b8; text-transform:uppercase; '
+        f'font-weight:600; letter-spacing:0.5px;">{label}</div>'
+        f'<div style="font-size:28px; font-weight:700; font-family:monospace; '
+        f'margin:4px 0; color:#f8fafc;">{valor_str}</div>'
+        f'<div style="font-size:12px; color:#94a3b8;">{subtexto}</div>'
+        f'<div style="font-size:12px; font-weight:600; color:{delta_color}; margin-top:4px;">{delta_text}</div>'
+        f'{age_html}'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    # Gráfico embebido debajo (como "piso" de la card)
+    if serie_valores and len(serie_valores) >= 2:
+        fig = go.Figure()
+
+        if chart_type == "bars":
+            fig.add_trace(go.Bar(
+                x=list(range(len(serie_valores))),
+                y=serie_valores,
+                marker=dict(color=color_hex),
+                hovertext=[f"{f}: {v}%" for f, v in zip(serie_fechas, serie_valores)] if serie_fechas else None,
+                hoverinfo="text",
+            ))
+        else:
+            fig.add_trace(go.Scatter(
+                x=list(range(len(serie_valores))),
+                y=serie_valores,
+                mode="lines",
+                line=dict(color=color_hex, width=2.5),
+                fill="tozeroy" if chart_type == "area" else None,
+                fillcolor=f"rgba{tuple(int(color_hex.lstrip('#')[i:i+2], 16) for i in (0,2,4)) + (0.15,)}",
+                hovertext=[f"{f}: {v}" for f, v in zip(serie_fechas, serie_valores)] if serie_fechas else None,
+                hoverinfo="text",
+            ))
+
+        y_min = min(serie_valores)
+        y_max = max(serie_valores)
+        y_range = y_max - y_min
+        if chart_type != "bars":
+            y_lower = y_min - y_range * 0.1 if y_range > 0 else y_min - 1
+            y_upper = y_max + y_range * 0.1 if y_range > 0 else y_max + 1
+        else:
+            y_lower = 0
+            y_upper = y_max * 1.15
+
+        fig.update_layout(
+            margin=dict(l=0, r=0, t=0, b=0),
+            paper_bgcolor="#0f1420",
+            plot_bgcolor="#0f1420",
+            xaxis=dict(
+                visible=False, fixedrange=True,
+                range=[-0.5, len(serie_valores) - 0.5],
+            ),
+            yaxis=dict(
+                visible=False, fixedrange=True,
+                range=[y_lower, y_upper],
+            ),
+            height=90,
+            showlegend=False,
+        )
+        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+    else:
+        # Placeholder si no hay datos
         st.markdown(
-            f'<div class="macro-big" style="min-height:130px;">'
-            f'<div class="macro-label">{label}</div>'
-            f'<div class="macro-val">{valor_str}</div>'
-            f'<div class="m-sub">{subtexto}</div>'
-            f'<div class="macro-delta" style="color:{delta_color}; margin-top:6px;">{delta_text}</div>'
-            f'{age_html}'
-            f'</div>',
+            '<div style="background:#0f1420; border:1px solid #1e293b; '
+            'border-top:none; border-radius:0 0 10px 10px; padding:30px; '
+            'text-align:center; color:#64748b; font-size:12px;">'
+            'Sin serie histórica disponible</div>',
             unsafe_allow_html=True,
         )
-    with col_chart:
-        if serie_valores and len(serie_valores) >= 2:
-            fig = sparkline(serie_valores, color_hex, height=130)
-            if fig:
-                st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
 
 def render_ipc_card():
@@ -324,15 +398,15 @@ def render_ipc_card():
 
     if mes is None:
         st.markdown(
-            '<div class="macro-big" style="border-color:#7f1d1d;">'
-            '<div class="macro-label" style="color:#fca5a5;">Inflación (IPC)</div>'
+            '<div class="metric-card" style="border-color:#7f1d1d;">'
+            '<div class="m-title" style="color:#fca5a5;">Inflación (IPC)</div>'
             '<div class="m-sub">Sin datos</div></div>',
             unsafe_allow_html=True,
         )
         return
 
     valor_str = f"{mes:.2f}%"
-    subtexto = f"Interanual: <b>{yoy:.1f}%</b>" if yoy is not None else ""
+    subtexto = f"Interanual: <b style='color:#f8fafc'>{yoy:.1f}%</b>" if yoy is not None else ""
 
     if accel is not None:
         if accel > 0:
@@ -345,13 +419,13 @@ def render_ipc_card():
             delta_text = "= Sin cambios vs mes previo"
             delta_color = "#94a3b8"
     else:
-        delta_text = ""
-        delta_color = "#94a3b8"
+        delta_text = ""; delta_color = "#94a3b8"
 
-    render_macro_card_with_sparkline(
+    macro_card_integrated(
         "Inflación (IPC mensual)",
         valor_str, subtexto, delta_text, delta_color,
-        serie.get("valores", []), "#ef4444",
+        serie.get("valores", []), serie.get("fechas", []),
+        "#ef4444", chart_type="bars",
     )
 
 
@@ -363,8 +437,8 @@ def render_emae_card():
 
     if val is None:
         st.markdown(
-            '<div class="macro-big" style="border-color:#7f1d1d;">'
-            '<div class="macro-label" style="color:#fca5a5;">Actividad (EMAE)</div>'
+            '<div class="metric-card" style="border-color:#7f1d1d;">'
+            '<div class="m-title" style="color:#fca5a5;">Actividad (EMAE)</div>'
             '<div class="m-sub">Sin datos</div></div>',
             unsafe_allow_html=True,
         )
@@ -386,11 +460,12 @@ def render_emae_card():
     else:
         delta_text = ""; delta_color = "#94a3b8"; subtexto = ""
 
-    render_macro_card_with_sparkline(
+    macro_card_integrated(
         "Actividad económica (EMAE)",
         valor_str, subtexto, delta_text, delta_color,
-        serie.get("valores", []), "#378ADD",
-        age_days=int(age) if age is not None else None,
+        serie.get("valores", []), serie.get("fechas", []),
+        "#378ADD", age_days=int(age) if age is not None else None,
+        chart_type="area",
     )
 
 
@@ -401,17 +476,16 @@ def render_salario_real_card():
 
     if yoy is None:
         st.markdown(
-            '<div class="macro-big" style="border-color:#7f1d1d;">'
-            '<div class="macro-label" style="color:#fca5a5;">Salario Real</div>'
+            '<div class="metric-card" style="border-color:#7f1d1d;">'
+            '<div class="m-title" style="color:#fca5a5;">Salario Real</div>'
             '<div class="m-sub">Sin datos</div></div>',
             unsafe_allow_html=True,
         )
         return
 
-    # yoy positivo: salarios le ganaron a la inflación
     if yoy > 0:
         valor_str = f"+{yoy:.1f}%"
-        delta_text = "Salarios le ganaron a la inflación"
+        delta_text = "Salarios le ganaron a inflación"
         delta_color = "#10b981"
     elif yoy < 0:
         valor_str = f"{yoy:.1f}%"
@@ -422,61 +496,56 @@ def render_salario_real_card():
         delta_text = "Sin variación real"
         delta_color = "#94a3b8"
 
-    subtexto = "Variación interanual del salario real"
+    subtexto = "Variación interanual (base 100)"
 
-    render_macro_card_with_sparkline(
-        "Salario real (base 100)",
+    macro_card_integrated(
+        "Salario real",
         valor_str, subtexto, delta_text, delta_color,
-        serie.get("valores", []), "#10b981",
-        age_days=int(age) if age is not None else None,
+        serie.get("valores", []), serie.get("fechas", []),
+        "#10b981", age_days=int(age) if age is not None else None,
+        chart_type="area",
     )
 
 
 # -----------------------------------------------------------
-# TABLA DE VALOR REAL CON SEMÁFORO
+# TABLA DE VALOR REAL con columna Evaluación semántica
 # -----------------------------------------------------------
 def tabla_valor_real(items_dict, bench, is_credit=False):
-    """
-    items_dict: {"Activo": retorno_usd_pct, ...}
-    bench: benchmark (%)
-    is_credit: True si es tabla de financiamiento (lógica invertida de color)
-    """
     rows = []
     for nombre, ret in items_dict.items():
         if ret is None:
             continue
         spread = ret - bench
-        # Evaluación del semáforo
-        if is_credit:
-            good = spread < 0  # costo menor al benchmark = bueno
-        else:
-            good = spread > 0  # retorno mayor al benchmark = bueno
 
-        if abs(spread) < 0.1:
+        if is_credit:
+            etiqueta, eval_class = etiqueta_financiamiento(spread)
+            good = spread < 0
+        else:
+            etiqueta, eval_class = etiqueta_inversion(spread)
+            good = spread > 0
+
+        if abs(spread) < 0.5:
             pill_class = "spread-flat"
-            evaluacion = "≈ Neutro"
         elif good:
             pill_class = "spread-good"
-            evaluacion = "✓ Superó benchmark" if not is_credit else "✓ Más barato que benchmark"
         else:
             pill_class = "spread-bad"
-            evaluacion = "✗ Por debajo" if not is_credit else "✗ Más caro que benchmark"
 
         rows.append({
             "nombre": nombre,
             "ret": ret,
             "spread": spread,
             "pill_class": pill_class,
-            "evaluacion": evaluacion,
+            "etiqueta": etiqueta,
+            "eval_class": eval_class,
         })
 
-    # Ordenar: para inversiones, mejor arriba (mayor spread). Para crédito, mejor arriba (menor spread = más barato).
+    # Ordenar
     if is_credit:
-        rows.sort(key=lambda x: x["spread"])
+        rows.sort(key=lambda x: x["spread"])  # menor spread primero (más licuación arriba)
     else:
-        rows.sort(key=lambda x: -x["spread"])
+        rows.sort(key=lambda x: -x["spread"])  # mayor spread primero (mejor arriba)
 
-    # Construir HTML
     filas_html = ""
     for r in rows:
         filas_html += (
@@ -485,7 +554,7 @@ def tabla_valor_real(items_dict, bench, is_credit=False):
             f'<td style="text-align:right;">{r["ret"]:+.2f}%</td>'
             f'<td style="text-align:right; color:#94a3b8;">{bench:+.2f}%</td>'
             f'<td style="text-align:right;"><span class="spread-pill {r["pill_class"]}">{r["spread"]:+.2f}pp</span></td>'
-            f'<td style="color:#94a3b8; font-size:12px;">{r["evaluacion"]}</td>'
+            f'<td><span class="eval-tag {r["eval_class"]}">{r["etiqueta"]}</span></td>'
             f'</tr>'
         )
 
@@ -584,7 +653,7 @@ with tab1:
 # TAB 2 - MACRO GLOBAL
 # ===========================================================
 with tab2:
-    st.info("Pendiente: integración con FRED para tasas Fed/SELIC, yield curve, CDS. Por ahora muestra lo que haya en DB_Macro si existe.")
+    st.info("Pendiente: integración con FRED para tasas Fed/SELIC, yield curve, CDS.")
 
     if not df_macro.empty:
         col1, col2 = st.columns(2)
@@ -621,7 +690,6 @@ with tab3:
     with col_b: render_emae_card()
     with col_c: render_salario_real_card()
 
-    # Lectura macro del LLM
     lectura = get_insight("lectura_macro", "")
     if lectura:
         st.markdown(
@@ -641,10 +709,10 @@ with tab3:
         bench = get_insight_float("bench_1m", default=-4.3)
         rendimientos = get_json("valor_real_1m_json", {})
         analisis_vr = get_insight("analisis_vr_1m", "")
-        # Placeholders marcados como estimados
         rendimientos["m2 CABA (est.)"] = 1.2
         rendimientos["Plazo Fijo (est.)"] = -4.0
         rendimientos["Dólares quietos"] = 0.0
+        # SGR mantiene su lugar en financiamiento (es deuda para la PyME emisora)
         financiamiento = {
             "Adelanto Cta Cte (est.)": 15.2,
             "Tarjeta (est.)": 8.4,
@@ -678,7 +746,6 @@ with tab3:
         st.caption(f"Benchmark dólares quietos: {bench:+.2f}%")
         tabla_valor_real(financiamiento, bench, is_credit=True)
 
-    # Comentario del LLM según intervalo
     if analisis_vr:
         label_periodo = "ESTE MES" if intervalo == "Mensual" else "EN LOS ÚLTIMOS 12 MESES"
         st.markdown(
