@@ -1,16 +1,3 @@
-"""
-Pipeline V18 - Dashboard Macro Argentina
-Corre una vez por día vía GitHub Actions.
-
-Cambios vs V17:
-- EMAE y Salarios desde apis.datos.gob.ar (la de argentinadatos no los tiene)
-    * EMAE: serie 143.3_NO_PR_2004_A_21 (nivel general desestacionalizado, base 2004=100)
-    * Salarios: serie 152.1_INDICE_SIRS_0_M_18 (Índice de Salarios Total, INDEC)
-- Salario real calculado como índice deflactado por IPC
-- Prompts a Gemini optimizados para evitar fallos (menos noticias, output más chico)
-- Log más detallado del finishReason cuando Gemini falla
-"""
-
 import os
 import json
 import time
