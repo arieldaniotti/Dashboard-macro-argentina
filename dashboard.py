@@ -7,191 +7,448 @@ import plotly.graph_objects as go
 import requests
 import json
 from datetime import timedelta
- 
+
+# -----------------------------------------------------------
+# CONFIG + CSS
+# -----------------------------------------------------------
 st.set_page_config(page_title="Terminal Macro", layout="wide", initial_sidebar_state="collapsed")
+
 st.markdown("""
     <style>
     .stApp { background-color: #07090f; color: #e2e8f0; font-family: sans-serif; }
-    .section-title { font-size: 20px; color: #38bdf8; font-weight: 800; text-transform: uppercase; border-bottom: 1px solid #1e293b; padding-bottom: 8px; margin: 20px 0;}
-    .metric-card { background-color: #0b0e18; border: 1px solid #1e293b; border-radius: 8px; padding: 15px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); }
+    .section-title {
+        font-size: 20px; color: #38bdf8; font-weight: 800;
+        text-transform: uppercase; border-bottom: 1px solid #1e293b;
+        padding-bottom: 8px; margin: 20px 0;
+    }
+    .metric-card {
+        background-color: #0b0e18; border: 1px solid #1e293b;
+        border-radius: 8px; padding: 15px;
+    }
     .m-title { font-size: 13px; color: #94a3b8; font-weight: bold; text-transform: uppercase; }
-    .m-val { font-size: 24px; font-weight: 700; font-family: monospace; margin: 8px 0; color: #f8fafc;}
-    .m-deltas { display: flex; justify-content: space-between; font-size: 12px; border-top: 1px solid #1e293b; padding-top: 8px; font-weight: 600;}
-    .d-up-good { color: #10b981; } .d-down-bad { color: #ef4444; }
-    .d-up-bad { color: #ef4444; } .d-down-good { color: #10b981; } .d-flat { color: #64748b; }
-    .ai-box { background-color: #0a1525; border: 1px solid #1a3050; border-radius: 8px; padding: 20px; height: 100%;}
+    .m-val { font-size: 24px; font-weight: 700; font-family: monospace; margin: 8px 0; color: #f8fafc; }
+    .m-sub { font-size: 12px; color: #64748b; margin-top: 4px; }
+    .m-deltas {
+        display: flex; justify-content: space-between;
+        font-size: 12px; border-top: 1px solid #1e293b;
+        padding-top: 8px; font-weight: 600;
+    }
+    .d-good { color: #10b981; }
+    .d-bad { color: #ef4444; }
+    .d-flat { color: #64748b; }
+    .ai-box {
+        background-color: #0a1525; border: 1px solid #1a3050;
+        border-radius: 8px; padding: 20px; height: 100%;
+    }
     .ai-line { font-size: 14px; color: #cbd5e1; line-height: 1.6; margin-bottom: 8px; }
-    .ai-label { color: #38bdf8; font-weight: bold; font-size: 12px; text-transform: uppercase; margin-right: 6px; }
+    .ai-label {
+        color: #38bdf8; font-weight: bold; font-size: 12px;
+        text-transform: uppercase; margin-right: 6px;
+    }
+    .news-card {
+        background-color: #0b0e18; border-left: 3px solid #38bdf8;
+        border-radius: 6px; padding: 12px 14px; margin-bottom: 10px;
+    }
+    .news-medio {
+        font-size: 11px; color: #38bdf8; text-transform: uppercase;
+        font-weight: bold; letter-spacing: 0.5px;
+    }
+    .news-title { font-size: 15px; color: #f8fafc; font-weight: 600; margin: 4px 0; }
+    .news-title a { color: #f8fafc; text-decoration: none; }
+    .news-title a:hover { color: #38bdf8; }
+    .news-why { font-size: 13px; color: #94a3b8; }
+    .macro-card {
+        background: linear-gradient(135deg, #0b0e18 0%, #0f1420 100%);
+        border: 1px solid #1e293b; border-radius: 10px;
+        padding: 18px; min-height: 120px;
+    }
+    .macro-label { font-size: 12px; color: #94a3b8; text-transform: uppercase; font-weight: 600; letter-spacing: 0.5px; }
+    .macro-val { font-size: 32px; font-weight: 700; font-family: monospace; margin: 6px 0; color: #f8fafc; }
+    .macro-sub { font-size: 13px; color: #94a3b8; }
     </style>
 """, unsafe_allow_html=True)
- 
- 
+
+
+# -----------------------------------------------------------
+# DATA LOAD
+# -----------------------------------------------------------
 @st.cache_data(ttl=600)
 def load_all():
-    scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+    scopes = ["https://www.googleapis.com/auth/spreadsheets",
+              "https://www.googleapis.com/auth/drive"]
     creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scopes)
     sh = gspread.authorize(creds).open("Dashboard Macro")
- 
+
     def read(n):
         try:
             data = sh.worksheet(n).get_all_values()
             if len(data) <= 1:
                 return pd.DataFrame()
             df = pd.DataFrame(data[1:], columns=data[0])
-            if 'fecha' in df.columns:
-                df['fecha'] = pd.to_datetime(df['fecha'], errors='coerce')
+            if "fecha" in df.columns:
+                df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
             return df
         except Exception:
             return pd.DataFrame()
- 
+
     return read("DB_Insights"), read("DB_Historico"), read("DB_Macro"), read("DB_Noticias")
- 
- 
+
+
 df_ai, df_hist, df_macro, df_news = load_all()
- 
- 
+
+
 # -----------------------------------------------------------
-# HELPER: acceso tolerante a columnas del nuevo DB_Insights
+# HELPERS TO ACCESS DB_Insights
 # -----------------------------------------------------------
 def get_insight(campo, default=""):
-    """
-    Lee un campo de DB_Insights sin romper si la columna no existe.
-    Soporta la estructura nueva (columnas separadas) y hace fallback decente.
-    """
-    if df_ai.empty:
-        return default
-    if campo not in df_ai.columns:
+    if df_ai.empty or campo not in df_ai.columns:
         return default
     try:
         val = str(df_ai[campo].iloc[-1]).strip()
         return val if val and val.lower() != "nan" else default
     except Exception:
         return default
- 
- 
-def get_snapshots():
-    """Lee el JSON de snapshots si existe (lo guarda el pipeline V15)."""
-    raw = get_insight("snapshots_json", "")
+
+
+def get_insight_float(campo, default=None):
+    raw = get_insight(campo, "")
     if not raw:
-        return {}
+        return default
+    try:
+        return float(raw)
+    except Exception:
+        return default
+
+
+def get_json(campo, default=None):
+    raw = get_insight(campo, "")
+    if not raw:
+        return default if default is not None else []
     try:
         return json.loads(raw)
     except Exception:
-        return {}
- 
- 
-def get_destacadas():
-    """Lee el JSON de noticias destacadas elegidas por el LLM."""
-    raw = get_insight("destacadas_json", "")
-    if not raw:
-        return []
-    try:
-        return json.loads(raw)
-    except Exception:
-        return []
- 
- 
+        return default if default is not None else []
+
+
 @st.cache_data(ttl=3600)
 def get_fear_greed():
     try:
         r = requests.get("https://api.alternative.me/fng/", timeout=5).json()
-        return r['data'][0]['value'], r['data'][0]['value_classification']
+        return r["data"][0]["value"], r["data"][0]["value_classification"]
     except Exception:
         return "N/A", "-"
- 
- 
+
+
 fng_val, fng_class = get_fear_greed()
- 
- 
-def aplicar_estilo_bloomberg(fig):
-    fig.update_layout(
-        xaxis_title="", yaxis_title="", legend_title="",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        margin=dict(l=0, r=0, t=30, b=0), hovermode="x unified",
-        paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
-        xaxis=dict(showgrid=True, gridcolor='#1e293b'),
-        yaxis=dict(showgrid=True, gridcolor='#1e293b'),
-    )
-    fig.update_traces(line=dict(width=2.5))
-    return fig
- 
- 
-def render_kpi(title, col, prefix="", suffix="", is_inverted=False, is_macro=False):
+
+
+# -----------------------------------------------------------
+# KPI RENDER - 3 MODOS
+# -----------------------------------------------------------
+def fmt_num(v, decimals=2):
+    """Formato argentino: 1.234.567,89"""
+    try:
+        s = f"{v:,.{decimals}f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        if decimals and s.endswith("," + "0" * decimals):
+            s = s[:-(decimals + 1)]
+        return s
+    except Exception:
+        return str(v)
+
+
+def color_class(delta, is_inverted=False):
+    """
+    is_inverted=True significa que subir es malo (riesgo país, dólar, brecha).
+    """
+    if abs(delta) < 0.01:
+        return "d-flat"
+    if is_inverted:
+        return "d-bad" if delta > 0 else "d-good"
+    return "d-good" if delta > 0 else "d-bad"
+
+
+def render_kpi(title, col, prefix="", suffix="", is_inverted=False, mode="ratio"):
+    """
+    mode:
+      - 'ratio': variación porcentual típica (precios). Muestra 1D/1M/1A en %.
+      - 'points': diferencia absoluta (riesgo país). Muestra 1D/1M/1A en bps.
+      - 'pp': diferencia en puntos porcentuales (brecha CCL, % en general).
+              El valor es un %, pero las variaciones se muestran en pp.
+    """
     try:
         if col not in df_hist.columns:
-            st.error(f"Faltan datos: {col}")
+            st.markdown(
+                f'<div class="metric-card" style="border-color:#7f1d1d;">'
+                f'<div class="m-title" style="color:#fca5a5;">{title}</div>'
+                f'<div class="m-sub">Faltan datos</div></div>',
+                unsafe_allow_html=True,
+            )
             return
- 
-        df = df_hist[['fecha', col]].copy()
-        df[col] = pd.to_numeric(df[col], errors='coerce')
-        df = df.dropna(subset=[col]).drop_duplicates(subset=['fecha'])
- 
+
+        df = df_hist[["fecha", col]].copy()
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=[col]).drop_duplicates(subset=["fecha"]).sort_values("fecha")
+
         if df.empty:
-            st.error(f"Sin registros válidos para {col}")
+            st.markdown(
+                f'<div class="metric-card" style="border-color:#7f1d1d;">'
+                f'<div class="m-title" style="color:#fca5a5;">{title}</div>'
+                f'<div class="m-sub">Sin registros válidos</div></div>',
+                unsafe_allow_html=True,
+            )
             return
- 
+
         val = df[col].iloc[-1]
-        last_date = df['fecha'].iloc[-1]
- 
-        df_1m = df[df['fecha'] <= (last_date - timedelta(days=30))]
-        ant_1m = df_1m.iloc[-1][col] if not df_1m.empty else df[col].iloc[0]
- 
-        df_1a = df[df['fecha'] <= (last_date - timedelta(days=365))]
-        ant_1a = df_1a.iloc[-1][col] if not df_1a.empty else df[col].iloc[0]
- 
-        is_points = col in ['Riesgo_Pais', 'Brecha_CCL']
- 
-        if is_points:
-            m1 = val - ant_1m
-            y1 = val - ant_1a
-        else:
+        last_date = df["fecha"].iloc[-1]
+
+        def get_ant(days):
+            sub = df[df["fecha"] <= (last_date - timedelta(days=days))]
+            return sub[col].iloc[-1] if not sub.empty else df[col].iloc[0]
+
+        df_prev_day = df[df["fecha"] < last_date]
+        val_1d = df_prev_day[col].iloc[-1] if not df_prev_day.empty else val
+        ant_1m = get_ant(30)
+        ant_1a = get_ant(365)
+
+        # Compute deltas according to mode
+        if mode == "ratio":
+            d1 = ((val / val_1d) - 1) * 100 if val_1d else 0
             m1 = ((val / ant_1m) - 1) * 100 if ant_1m else 0
             y1 = ((val / ant_1a) - 1) * 100 if ant_1a else 0
- 
-        def get_clr(d):
-            if abs(d) < 0.05:
-                return "d-flat"
-            if is_inverted:
-                return "d-up-bad" if d > 0 else "d-down-good"
-            return "d-up-good" if d > 0 else "d-down-bad"
- 
-        fmt_m = f"{m1:+.1f}bps" if is_points and col == 'Riesgo_Pais' else f"{m1:+.1f}%"
-        fmt_y = f"{y1:+.1f}bps" if is_points and col == 'Riesgo_Pais' else f"{y1:+.1f}%"
- 
-        val_str = f"{val:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-        if val_str.endswith(",00"):
-            val_str = val_str[:-3]
- 
-        if is_macro:
-            st.markdown(
-                f'<div class="metric-card"><div class="m-title">{title}</div>'
-                f'<div class="m-val">{prefix}{val_str}{suffix}</div>'
-                f'<div class="m-deltas">'
-                f'<span>1M: <span class="{get_clr(m1)}">{fmt_m}</span></span>'
-                f'<span>1A: <span class="{get_clr(y1)}">{fmt_y}</span></span>'
-                f'</div></div>',
-                unsafe_allow_html=True,
-            )
+            unit_d, unit_m, unit_y = "%", "%", "%"
+        elif mode == "points":
+            d1 = val - val_1d
+            m1 = val - ant_1m
+            y1 = val - ant_1a
+            unit_d, unit_m, unit_y = "bps", "bps", "bps"
+        elif mode == "pp":
+            d1 = val - val_1d
+            m1 = val - ant_1m
+            y1 = val - ant_1a
+            unit_d, unit_m, unit_y = "pp", "pp", "pp"
         else:
-            # 1D robusto: buscar el día hábil anterior con dato distinto
-            df_prev = df[df['fecha'] < last_date]
-            val_1d = df_prev[col].iloc[-1] if not df_prev.empty else val
-            d1 = (val - val_1d) if is_points else ((val / val_1d) - 1) * 100 if val_1d else 0
-            fmt_d = f"{d1:+.1f}bps" if is_points and col == 'Riesgo_Pais' else f"{d1:+.1f}%"
-            st.markdown(
-                f'<div class="metric-card"><div class="m-title">{title}</div>'
-                f'<div class="m-val">{prefix}{val_str}{suffix}</div>'
-                f'<div class="m-deltas">'
-                f'<span>1D: <span class="{get_clr(d1)}">{fmt_d}</span></span>'
-                f'<span>1M: <span class="{get_clr(m1)}">{fmt_m}</span></span>'
-                f'<span>1A: <span class="{get_clr(y1)}">{fmt_y}</span></span>'
-                f'</div></div>',
-                unsafe_allow_html=True,
-            )
+            d1 = m1 = y1 = 0
+            unit_d = unit_m = unit_y = ""
+
+        # Format number (value shown)
+        if mode == "points":
+            val_str = f"{int(val):,}".replace(",", ".")
+        else:
+            val_str = fmt_num(val, 2)
+
+        def fmt_delta(v, u):
+            return f"{v:+.1f}{u}"
+
+        st.markdown(
+            f'<div class="metric-card">'
+            f'<div class="m-title">{title}</div>'
+            f'<div class="m-val">{prefix}{val_str}{suffix}</div>'
+            f'<div class="m-deltas">'
+            f'<span>1D: <span class="{color_class(d1, is_inverted)}">{fmt_delta(d1, unit_d)}</span></span>'
+            f'<span>1M: <span class="{color_class(m1, is_inverted)}">{fmt_delta(m1, unit_m)}</span></span>'
+            f'<span>1A: <span class="{color_class(y1, is_inverted)}">{fmt_delta(y1, unit_y)}</span></span>'
+            f'</div></div>',
+            unsafe_allow_html=True,
+        )
     except Exception as e:
-        st.error(f"Error {col}: {e}")
- 
- 
+        st.markdown(
+            f'<div class="metric-card" style="border-color:#7f1d1d;">'
+            f'<div class="m-title" style="color:#fca5a5;">{title}</div>'
+            f'<div class="m-sub">Error: {str(e)[:60]}</div></div>',
+            unsafe_allow_html=True,
+        )
+
+
+# -----------------------------------------------------------
+# MACRO CARD (IPC, EMAE, RIPTE) - render especial
+# -----------------------------------------------------------
+def render_macro_ipc():
+    """Card de IPC: usa ipc_mes / ipc_yoy / ipc_accel_pp del pipeline."""
+    mes = get_insight_float("ipc_mes")
+    yoy = get_insight_float("ipc_yoy")
+    accel = get_insight_float("ipc_accel_pp")
+
+    if mes is None:
+        st.markdown(
+            '<div class="macro-card" style="border-color:#7f1d1d;">'
+            '<div class="macro-label" style="color:#fca5a5;">Inflación (IPC)</div>'
+            '<div class="macro-sub">Sin datos</div></div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    accel_html = ""
+    if accel is not None:
+        color = "#ef4444" if accel > 0 else "#10b981" if accel < 0 else "#64748b"
+        flecha = "↑" if accel > 0 else "↓" if accel < 0 else "="
+        texto = "Aceleró" if accel > 0 else "Desaceleró" if accel < 0 else "Sin cambios"
+        accel_html = f'<span style="color:{color};">{flecha} {texto} {abs(accel):.2f}pp vs mes previo</span>'
+
+    yoy_html = f"Interanual: <b>{yoy:.1f}%</b>" if yoy is not None else ""
+
+    st.markdown(
+        f'<div class="macro-card">'
+        f'<div class="macro-label">Inflación (IPC último mes)</div>'
+        f'<div class="macro-val">{mes:.2f}%</div>'
+        f'<div class="macro-sub">{yoy_html}</div>'
+        f'<div class="macro-sub" style="margin-top:6px;">{accel_html}</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def render_macro_generic(title, col, prefix="", suffix=""):
+    """EMAE / RIPTE / cualquier serie macro genérica que publica con delay."""
+    if col not in df_hist.columns:
+        st.markdown(
+            f'<div class="macro-card" style="border-color:#7f1d1d;">'
+            f'<div class="macro-label" style="color:#fca5a5;">{title}</div>'
+            f'<div class="macro-sub">Sin datos</div></div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    df = df_hist[["fecha", col]].copy()
+    df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=[col]).drop_duplicates(subset=["fecha"]).sort_values("fecha")
+
+    if df.empty:
+        st.markdown(
+            f'<div class="macro-card" style="border-color:#7f1d1d;">'
+            f'<div class="macro-label" style="color:#fca5a5;">{title}</div>'
+            f'<div class="macro-sub">Sin datos</div></div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    val = df[col].iloc[-1]
+    last = df["fecha"].iloc[-1]
+    age_days = (pd.Timestamp.now() - last).days
+
+    df_1m = df[df["fecha"] <= (last - timedelta(days=30))]
+    ant_1m = df_1m[col].iloc[-1] if not df_1m.empty else None
+
+    df_1a = df[df["fecha"] <= (last - timedelta(days=365))]
+    ant_1a = df_1a[col].iloc[-1] if not df_1a.empty else None
+
+    m1 = ((val / ant_1m) - 1) * 100 if ant_1m else None
+    y1 = ((val / ant_1a) - 1) * 100 if ant_1a else None
+
+    def delta_html(d, suffix="%"):
+        if d is None:
+            return '<span style="color:#64748b;">—</span>'
+        color = "#10b981" if d > 0 else "#ef4444" if d < 0 else "#64748b"
+        return f'<span style="color:{color}; font-weight:600;">{d:+.1f}{suffix}</span>'
+
+    val_fmt = fmt_num(val, 2)
+    fecha_str = last.strftime("%m/%Y") + (f" (dato de hace {age_days}d)" if age_days > 45 else "")
+
+    st.markdown(
+        f'<div class="macro-card">'
+        f'<div class="macro-label">{title}</div>'
+        f'<div class="macro-val">{prefix}{val_fmt}{suffix}</div>'
+        f'<div class="macro-sub">Último dato: {fecha_str}</div>'
+        f'<div class="macro-sub" style="margin-top:8px;">'
+        f'1M: {delta_html(m1)} · 1A: {delta_html(y1)}'
+        f'</div></div>',
+        unsafe_allow_html=True,
+    )
+
+
+# -----------------------------------------------------------
+# VALOR REAL DOT PLOT (reemplaza las barras feas)
+# -----------------------------------------------------------
+def dot_plot_valor_real(data_dict, bench, titulo, is_credit=False):
+    """
+    data_dict: {"Activo": retorno_usd, ...}
+    bench: benchmark %
+    is_credit: para financiamiento, la interpretación se invierte
+               (costo por encima del benchmark = malo → rojo).
+    """
+    # Filtrar Nones
+    items = [(k, v) for k, v in data_dict.items() if v is not None]
+    if not items:
+        st.warning(f"Sin datos para {titulo}")
+        return
+
+    # Ordenar por rendimiento (asc) para que mejor quede arriba en horizontal
+    items = sorted(items, key=lambda x: x[1])
+    labels = [k for k, _ in items]
+    values = [v for _, v in items]
+
+    # Color según distancia al benchmark
+    colors = []
+    for v in values:
+        if is_credit:
+            # En crédito: v < bench es bueno (me cuesta menos que dólares quietos)
+            good = v < bench
+        else:
+            good = v > bench
+        colors.append("#10b981" if good else "#ef4444")
+
+    fig = go.Figure()
+
+    # Línea de distancia desde benchmark al punto
+    for i, (lbl, v, c) in enumerate(zip(labels, values, colors)):
+        fig.add_trace(go.Scatter(
+            x=[bench, v],
+            y=[lbl, lbl],
+            mode="lines",
+            line=dict(color=c, width=4),
+            showlegend=False,
+            hoverinfo="skip",
+        ))
+
+    # Puntos con los valores
+    fig.add_trace(go.Scatter(
+        x=values,
+        y=labels,
+        mode="markers+text",
+        marker=dict(size=14, color=colors, line=dict(color="#ffffff", width=1.5)),
+        text=[f"{v:+.1f}%" for v in values],
+        textposition="middle right",
+        textfont=dict(color="#f8fafc", size=12),
+        showlegend=False,
+        hovertemplate="<b>%{y}</b><br>Retorno USD: %{x:.2f}%<extra></extra>",
+    ))
+
+    # Línea vertical del benchmark
+    fig.add_vline(
+        x=bench,
+        line=dict(color="#fbbf24", width=2, dash="dash"),
+        annotation=dict(
+            text=f"Benchmark: {bench:+.2f}%",
+            showarrow=False,
+            xanchor="left",
+            yanchor="bottom",
+            font=dict(color="#fbbf24", size=11),
+            bgcolor="rgba(7, 9, 15, 0.8)",
+        ),
+        annotation_position="top",
+    )
+
+    # Padding del eje X
+    all_x = values + [bench]
+    x_min = min(all_x) - abs(max(all_x) - min(all_x)) * 0.15 - 2
+    x_max = max(all_x) + abs(max(all_x) - min(all_x)) * 0.25 + 2
+
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=10, r=50, t=20, b=30),
+        height=max(250, 50 * len(labels) + 60),
+        xaxis=dict(
+            showgrid=True, gridcolor="rgba(30, 41, 59, 0.5)",
+            zeroline=True, zerolinecolor="#334155", zerolinewidth=1,
+            ticksuffix="%", range=[x_min, x_max],
+        ),
+        yaxis=dict(showgrid=False, tickfont=dict(size=13)),
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+
 # -----------------------------------------------------------
 # TABS
 # -----------------------------------------------------------
@@ -200,60 +457,58 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "📌 Resumen", "🌎 Macro Global", "🇦🇷 AR Estrategia",
     "🔮 Expectativas", "🏗️ Inmobiliario", "💼 Portafolio",
 ])
- 
-# -----------------------------------------------------------
-# TAB 1 — RESUMEN (parche mínimo, rediseño en próxima entrega)
-# -----------------------------------------------------------
+
+# ===========================================================
+# TAB 1 - RESUMEN
+# ===========================================================
 with tab1:
     st.markdown('<div class="section-title">🌐 MUNDO</div>', unsafe_allow_html=True)
     c1, c2, c3, c4 = st.columns(4)
-    with c1: render_kpi("S&P 500", "SP500")
-    with c2: render_kpi("Brent", "Brent", prefix="USD ")
-    with c3: render_kpi("Bitcoin", "BTC", prefix="USD ")
-    with c4: render_kpi("Oro", "Oro", prefix="USD ")
- 
+    with c1: render_kpi("S&P 500", "SP500", mode="ratio")
+    with c2: render_kpi("Brent", "Brent", prefix="USD ", mode="ratio")
+    with c3: render_kpi("Bitcoin", "BTC", prefix="USD ", mode="ratio")
+    with c4: render_kpi("Oro", "Oro", prefix="USD ", mode="ratio")
+
     st.markdown('<div class="section-title">🇦🇷 ARGENTINA</div>', unsafe_allow_html=True)
     c5, c6, c7, c8 = st.columns(4)
-    with c5: render_kpi("Merval", "Merval")
-    with c6: render_kpi("Riesgo País", "Riesgo_Pais", suffix=" bps", is_inverted=True)
-    with c7: render_kpi("Dólar Oficial", "USD_Oficial", prefix="$", is_inverted=True)
-    with c8: render_kpi("Brecha CCL", "Brecha_CCL", suffix="%", is_inverted=True)
- 
+    with c5: render_kpi("Merval", "Merval", mode="ratio")
+    with c6: render_kpi("Riesgo País", "Riesgo_Pais", suffix=" bps", is_inverted=True, mode="points")
+    with c7: render_kpi("Dólar Oficial", "USD_Oficial", prefix="$", is_inverted=True, mode="ratio")
+    with c8: render_kpi("Brecha CCL", "Brecha_CCL", suffix="%", is_inverted=True, mode="pp")
+
     st.markdown("<br>", unsafe_allow_html=True)
     col_fg, col_ia = st.columns([1, 3])
- 
+
     with col_fg:
         color_fg = "#ef4444" if "Fear" in fng_class else "#10b981" if "Greed" in fng_class else "#f59e0b"
         st.markdown(
-            f"""
-        <div class="metric-card" style="text-align: center; height: 100%; display: flex; flex-direction: column; justify-content: center;">
-            <div class="m-title" style="margin-bottom: 10px;">Cripto Fear & Greed</div>
-            <div class="m-val" style="font-size: 32px; color: {color_fg};">{fng_val}</div>
-            <div style="color: {color_fg}; font-weight: bold;">{fng_class.upper()}</div>
-        </div>
-        """,
+            f'<div class="metric-card" style="text-align:center; height:100%; '
+            f'display:flex; flex-direction:column; justify-content:center;">'
+            f'<div class="m-title" style="margin-bottom:10px;">Cripto Fear & Greed</div>'
+            f'<div class="m-val" style="font-size:32px; color:{color_fg};">{fng_val}</div>'
+            f'<div style="color:{color_fg}; font-weight:bold;">{fng_class.upper()}</div>'
+            f'</div>',
             unsafe_allow_html=True,
         )
- 
+
     with col_ia:
         mundo = get_insight("mundo", "Sin datos")
         argentina = get_insight("argentina", "Sin datos")
         a_mirar = get_insight("a_mirar", "Sin datos")
- 
+
         st.markdown(
-            f"""
-        <div class="ai-box">
-            <div style="color:#38bdf8;font-weight:bold;margin-bottom:12px;font-size:14px;">🤖 FLASH MARKET</div>
-            <div class="ai-line"><span class="ai-label">🌐 Mundo:</span>{mundo}</div>
-            <div class="ai-line"><span class="ai-label">🇦🇷 Argentina:</span>{argentina}</div>
-            <div class="ai-line"><span class="ai-label">👀 A mirar:</span>{a_mirar}</div>
-        </div>
-        """,
+            f'<div class="ai-box">'
+            f'<div style="color:#38bdf8;font-weight:bold;margin-bottom:12px;font-size:14px;">'
+            f'🤖 FLASH MARKET</div>'
+            f'<div class="ai-line"><span class="ai-label">🌐 Mundo:</span>{mundo}</div>'
+            f'<div class="ai-line"><span class="ai-label">🇦🇷 Argentina:</span>{argentina}</div>'
+            f'<div class="ai-line"><span class="ai-label">👀 A mirar:</span>{a_mirar}</div>'
+            f'</div>',
             unsafe_allow_html=True,
         )
- 
-    # Noticias destacadas (si el LLM las eligió)
-    destacadas = get_destacadas()
+
+    # Noticias destacadas
+    destacadas = get_json("destacadas_json", [])
     if destacadas:
         st.markdown('<div class="section-title">📰 NOTICIAS DESTACADAS</div>', unsafe_allow_html=True)
         for n in destacadas[:5]:
@@ -262,189 +517,133 @@ with tab1:
             url = n.get("url", "#")
             por_que = n.get("por_que_importa", "")
             st.markdown(
-                f"""
-            <div class="metric-card" style="margin-bottom: 10px;">
-                <div style="font-size: 11px; color: #38bdf8; text-transform: uppercase; font-weight: bold;">{medio}</div>
-                <div style="font-size: 15px; color: #f8fafc; font-weight: 600; margin: 6px 0;">
-                    <a href="{url}" target="_blank" style="color:#f8fafc; text-decoration:none;">{titular}</a>
-                </div>
-                <div style="font-size: 13px; color: #94a3b8;">{por_que}</div>
-            </div>
-            """,
+                f'<div class="news-card">'
+                f'<div class="news-medio">{medio}</div>'
+                f'<div class="news-title"><a href="{url}" target="_blank">{titular}</a></div>'
+                f'<div class="news-why">{por_que}</div>'
+                f'</div>',
                 unsafe_allow_html=True,
             )
- 
-# -----------------------------------------------------------
-# TAB 2 — MACRO GLOBAL (sin cambios)
-# -----------------------------------------------------------
+
+
+# ===========================================================
+# TAB 2 - MACRO GLOBAL (placeholder, trabajo futuro)
+# ===========================================================
 with tab2:
-    st.subheader("Contexto Internacional y Tasas")
-    col1, col2 = st.columns(2)
+    st.info("Pendiente: integración con FRED para tasas Fed/SELIC, yield curve, y CDS de países emergentes. Por ahora funciona si ya tenés la hoja DB_Macro cargada.")
+
     if not df_macro.empty:
+        col1, col2 = st.columns(2)
         with col1:
-            st.markdown("**Evolución Tasa FED vs SELIC (Brasil)**")
-            tasas_cols = [c for c in ['FEDFUNDS', 'Tasa_SELIC_Brasil'] if c in df_macro.columns]
+            tasas_cols = [c for c in ["FEDFUNDS", "Tasa_SELIC_Brasil"] if c in df_macro.columns]
             if tasas_cols:
+                st.markdown("**Tasas de política monetaria**")
                 for c in tasas_cols:
-                    df_macro[c] = pd.to_numeric(df_macro[c], errors='coerce')
-                fig_tasas = px.line(df_macro, x='fecha', y=tasas_cols, template='plotly_dark',
-                                    color_discrete_sequence=['#38bdf8', '#34d399'])
-                st.plotly_chart(aplicar_estilo_bloomberg(fig_tasas), use_container_width=True)
+                    df_macro[c] = pd.to_numeric(df_macro[c], errors="coerce")
+                fig = px.line(df_macro, x="fecha", y=tasas_cols, template="plotly_dark",
+                              color_discrete_sequence=["#38bdf8", "#34d399"])
+                fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                                  margin=dict(l=0, r=0, t=30, b=0), legend_title="")
+                st.plotly_chart(fig, use_container_width=True)
+
         with col2:
-            st.markdown("**Yield Curve (10Y - 2Y)**")
-            if 'T10Y2Y' in df_macro.columns:
-                df_macro['T10Y2Y'] = pd.to_numeric(df_macro['T10Y2Y'], errors='coerce')
-                fig_yield = px.area(df_macro, x='fecha', y='T10Y2Y', template='plotly_dark',
-                                    color_discrete_sequence=['#f59e0b'])
-                fig_yield.update_traces(fillcolor='rgba(245, 158, 11, 0.2)', line=dict(width=2))
-                st.plotly_chart(aplicar_estilo_bloomberg(fig_yield), use_container_width=True)
-    else:
-        st.info("No hay datos de DB_Macro todavía. Este tab se llena cuando incorporemos la fuente FRED.")
- 
-# -----------------------------------------------------------
-# TAB 3 — ARGENTINA (parche: usa dato_real del nuevo DB_Insights)
-# -----------------------------------------------------------
+            if "T10Y2Y" in df_macro.columns:
+                st.markdown("**Yield curve 10Y-2Y**")
+                df_macro["T10Y2Y"] = pd.to_numeric(df_macro["T10Y2Y"], errors="coerce")
+                fig = px.area(df_macro, x="fecha", y="T10Y2Y", template="plotly_dark",
+                              color_discrete_sequence=["#f59e0b"])
+                fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                                  margin=dict(l=0, r=0, t=30, b=0))
+                st.plotly_chart(fig, use_container_width=True)
+
+
+# ===========================================================
+# TAB 3 - ARGENTINA
+# ===========================================================
 with tab3:
     st.markdown('<div class="section-title">🇦🇷 SEMÁFORO MACROECONÓMICO</div>', unsafe_allow_html=True)
     c1, c2, c3 = st.columns(3)
-    with c1: render_kpi("Inflación (IPC Últ. Mes)", "IPC", suffix="%", is_macro=True)
-    with c2: render_kpi("Actividad (EMAE)", "EMAE", suffix=" pts", is_macro=True)
-    with c3: render_kpi("Salario (RIPTE)", "RIPTE", prefix="$", is_macro=True)
- 
+    with c1: render_macro_ipc()
+    with c2: render_macro_generic("Actividad (EMAE)", "EMAE", suffix=" pts")
+    with c3: render_macro_generic("Salario (RIPTE)", "RIPTE", prefix="$")
+
     st.markdown('<div class="section-title">🔍 ANÁLISIS DE VALOR REAL (BASE USD)</div>', unsafe_allow_html=True)
-    intervalo = st.radio("Seleccionar Intervalo:", ["Mensual", "Anual"], horizontal=True)
- 
-    # Leer benchmark del nuevo formato
-    bench_col = 'bench_1m' if intervalo == "Mensual" else 'bench_1a'
-    try:
-        bench = float(get_insight(bench_col, "-4.3"))
-    except Exception:
-        bench = -4.3
- 
-    def get_real_ret(col, es_pesos=False):
-        try:
-            cols_needed = ['fecha', col, 'CCL'] if es_pesos else ['fecha', col]
-            df = df_hist[cols_needed].copy()
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-            if es_pesos:
-                df['CCL'] = pd.to_numeric(df['CCL'], errors='coerce')
-                df = df.dropna(subset=[col, 'CCL'])
-            else:
-                df = df.dropna(subset=[col])
- 
-            if df.empty:
-                return 0.0
- 
-            v_h = df[col].iloc[-1]
-            last_date = df['fecha'].iloc[-1]
-            ccl_h = df['CCL'].iloc[-1] if es_pesos else 1
- 
-            df_a = df[df['fecha'] <= (last_date - timedelta(days=30 if intervalo == "Mensual" else 365))]
-            if df_a.empty:
-                v_a = df[col].iloc[0]
-                ccl_a = df['CCL'].iloc[0] if es_pesos else 1
-            else:
-                v_a = df_a[col].iloc[-1]
-                ccl_a = df_a['CCL'].iloc[-1] if es_pesos else 1
- 
-            usd_h = v_h / ccl_h if es_pesos else v_h
-            usd_a = v_a / ccl_a if es_pesos else v_a
- 
-            return ((usd_h / usd_a) - 1) * 100
-        except Exception:
-            return 0.0
- 
-    r_merval = get_real_ret("Merval", True)
-    r_al30 = get_real_ret("AL30", True)
-    r_sp500 = get_real_ret("SP500", False)
- 
+
+    intervalo = st.radio("Intervalo:", ["Mensual", "Anual"], horizontal=True, label_visibility="collapsed")
+
+    # Benchmark del intervalo elegido
+    bench_col = "bench_1m" if intervalo == "Mensual" else "bench_1a"
+    bench = get_insight_float(bench_col, default=-4.3)
+
+    # Rendimientos precalculados en el pipeline
+    if intervalo == "Mensual":
+        rendimientos = get_json("valor_real_1m_json", {})
+    else:
+        rendimientos = get_json("valor_real_1a_json", {})
+
+    # Placeholders para activos sin datos propios (los fijos quedan claramente marcados)
+    # TODO: reemplazar por datos reales cuando tengamos APIs
+    if intervalo == "Mensual":
+        rendimientos["m2 CABA (est.)"] = 1.2
+        rendimientos["Plazo Fijo (est.)"] = -4.0
+        rendimientos["Dólares quietos"] = 0.0
+    else:
+        rendimientos["m2 CABA (est.)"] = 5.5
+        rendimientos["Plazo Fijo (est.)"] = -25.0
+        rendimientos["Dólares quietos"] = 0.0
+
+    # Costos de financiamiento (placeholders - TODO API BCRA)
+    if intervalo == "Mensual":
+        financiamiento = {
+            "Adelanto Cta Cte (est.)": 15.2,
+            "Tarjeta (est.)": 8.4,
+            "Préstamo Personal (est.)": 5.1,
+            "Hipotecario UVA (est.)": 2.0,
+            "SGR Cheques (est.)": -4.5,
+        }
+    else:
+        financiamiento = {
+            "Adelanto Cta Cte (est.)": 85.0,
+            "Tarjeta (est.)": 60.0,
+            "Préstamo Personal (est.)": 45.0,
+            "Hipotecario UVA (est.)": 12.0,
+            "SGR Cheques (est.)": -10.0,
+        }
+
     col_inv, col_fin = st.columns(2)
     with col_inv:
-        st.subheader("💰 Inversiones medidas en USD")
-        df_i = pd.DataFrame({
-            "Activo": ["Merval", "AL30", "S&P 500", "Dólares sin invertir", "m2 Venta (CABA)", "Plazo Fijo"],
-            "Ret": [r_merval, r_al30, r_sp500, 0.0,
-                    1.2 if intervalo == "Mensual" else 5.5,
-                    -4.0 if intervalo == "Mensual" else -25.0],
-        })
-        df_i["Neta"] = df_i["Ret"] - bench
-        df_i = df_i.sort_values("Neta")
-        fig = go.Figure(go.Bar(
-            x=df_i["Neta"], y=df_i["Activo"], orientation='h',
-            marker_color=['#10b981' if v > 0 else '#ef4444' for v in df_i["Neta"]],
-            text=[f"{v:+.1f}%" for v in df_i["Neta"]],
-            textposition='outside', textfont=dict(color='white'),
-        ))
-        fig.add_vline(x=0, line_width=2, line_color="#cbd5e1", line_dash="dash", annotation_text=" PUNTO EQUILIBRIO")
-        fig.update_layout(template='plotly_dark', margin=dict(l=0, r=40, t=10, b=0), height=350,
-                          xaxis=dict(showgrid=False),
-                          paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
-        st.plotly_chart(fig, use_container_width=True)
- 
+        st.subheader("💰 Inversiones en USD")
+        st.caption(f"Benchmark: {bench:+.2f}% · Verde = supera el benchmark (ganó poder de compra)")
+        dot_plot_valor_real(rendimientos, bench, "Inversiones", is_credit=False)
+
     with col_fin:
         st.subheader("💳 Costo de financiamiento en USD")
-        df_f = pd.DataFrame({
-            "Línea": ["Adelanto Cta Cte", "Tarjeta", "Préstamo Personal", "Hipotecario UVA", "SGR (Cheques)"],
-            "Costo": [15.2, 8.4, 5.1, 2.0, -4.5] if intervalo == "Mensual" else [85.0, 60.0, 45.0, 12.0, -10.0],
-        })
-        df_f["Neta"] = df_f["Costo"] - bench
-        df_f = df_f.sort_values("Neta")
-        fig_f = go.Figure(go.Bar(
-            x=df_f["Neta"], y=df_f["Línea"], orientation='h',
-            marker_color=['#ef4444' if v > 0 else '#10b981' for v in df_f["Neta"]],
-            text=[f"{v:+.1f}%" for v in df_f["Neta"]],
-            textposition='outside', textfont=dict(color='white'),
-        ))
-        fig_f.add_vline(x=0, line_width=2, line_color="#cbd5e1", line_dash="dash", annotation_text=" PUNTO EQUILIBRIO")
-        fig_f.update_layout(template='plotly_dark', margin=dict(l=0, r=40, t=10, b=0), height=350,
-                            xaxis=dict(showgrid=False),
-                            paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
-        st.plotly_chart(fig_f, use_container_width=True)
- 
-    # Explicación: ahora viene directo de la columna dato_real
-    dato_real = get_insight("dato_real", "")
-    if dato_real:
+        st.caption(f"Benchmark: {bench:+.2f}% · Verde = costo menor al benchmark (el crédito fue negocio)")
+        dot_plot_valor_real(financiamiento, bench, "Financiamiento", is_credit=True)
+
+    # Comentario del LLM sobre el gráfico
+    analisis = get_insight("analisis_valor_real", "")
+    if analisis:
         st.markdown(
             f'<div class="ai-box" style="margin-top:20px;">'
-            f'<div style="color:#38bdf8;font-weight:bold;margin-bottom:10px;font-size:14px;">💡 LA EXPLICACIÓN</div>'
-            f'<div style="font-size:15px;color:#cbd5e1;line-height:1.6;">{dato_real}</div>'
+            f'<div style="color:#38bdf8;font-weight:bold;margin-bottom:10px;font-size:14px;">'
+            f'💡 QUÉ PASÓ ESTE {"MES" if intervalo == "Mensual" else "AÑO"}</div>'
+            f'<div style="font-size:15px;color:#cbd5e1;line-height:1.7;">{analisis}</div>'
             f'</div>',
             unsafe_allow_html=True,
         )
- 
-# -----------------------------------------------------------
-# TABS 4, 5, 6 — placeholders
-# -----------------------------------------------------------
+
+    st.caption("💡 Los valores marcados con (est.) son estimaciones. Pendiente de conectar APIs de BCRA (tasas de préstamos y plazo fijo) y Reporte Inmobiliario (m2).")
+
+
+# ===========================================================
+# TABS 4, 5, 6 - placeholders
+# ===========================================================
 with tab4:
-    st.subheader("Curvas de Futuros y Expectativas (REM)")
-    st.caption("Datos implícitos Matba Rofex.")
-    col1, col2, col3, col4 = st.columns(4)
- 
-    def render_future_card(contrato, precio, tna, delta_precio):
-        color = "color: #10b981;" if delta_precio < 0 else "color: #ef4444;"
-        st.markdown(f"""
-        <div class="metric-card" style="padding: 15px;">
-            <div style="font-size: 14px; color: #94a3b8; font-weight: bold; text-transform: uppercase;">{contrato}</div>
-            <div style="font-size: 24px; color: #f8fafc; font-weight: bold; font-family: monospace; margin: 8px 0;">$ {precio}</div>
-            <div style="display: flex; justify-content: space-between; font-size: 14px; border-top: 1px solid #1e293b; padding-top: 8px;">
-                <span style="color: #38bdf8; font-weight: bold;">TNA: {tna}%</span>
-                <span style="{color} font-weight: bold;">{delta_precio}% 1D</span>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
- 
-    with col1: render_future_card("Fin Mes Actual", "1.415,50", "45.2", 0.15)
-    with col2: render_future_card("Fin Próximo Mes", "1.468,20", "48.5", -0.05)
-    with col3: render_future_card("Diciembre", "1.750,00", "52.1", 1.20)
- 
-    st.markdown("<br>### Inflación Esperada (REM BCRA)", unsafe_allow_html=True)
-    col5, col6, col7, col8 = st.columns(4)
-    with col5: render_future_card("IPC Mes Próximo", "4.5", "-", -0.2)
-    with col6: render_future_card("IPC 12 Meses", "65.0", "-", -2.5)
- 
+    st.info("Módulo de Expectativas (curvas de futuros Rofex, REM BCRA) en desarrollo.")
+
 with tab5:
     st.info("Módulo Inmobiliario en desarrollo.")
- 
+
 with tab6:
     st.info("Módulo de Portafolio en desarrollo.")
- 
