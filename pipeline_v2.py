@@ -1,15 +1,3 @@
-"""
-Pipeline V16 - Dashboard Macro Argentina
-Corre una vez por día vía GitHub Actions.
-
-Cambios vs V15:
-- Modelo: gemini-2.5-flash (el 1.5 fue shutdown)
-- IPC: se guarda ipc_mes, ipc_yoy (compuesto) y ipc_accel_pp
-- Snapshots con tres modos: ratio (precios), points (riesgo país), pp (brecha, %)
-- Dos prompts separados: resumen_diario + analisis_valor_real
-- DB_Insights estructurado por columnas, no strings concatenados
-"""
-
 import os
 import json
 import time
