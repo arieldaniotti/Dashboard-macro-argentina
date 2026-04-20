@@ -1,14 +1,3 @@
-"""
-Dashboard V4 - Dashboard Económico Financiero Argentina
-Consume de Sheets (pipeline V17).
-
-Cambios vs V3:
-- Tarjetas macro IPC / EMAE / Salario Real con sparkline 12m
-- Lectura macro del LLM debajo de las 3 tarjetas
-- Gráfico de valor real → tabla con semáforo en la columna spread
-- Análisis del LLM alterna entre mensual y anual según radio
-"""
-
 import streamlit as st
 import pandas as pd
 import gspread
