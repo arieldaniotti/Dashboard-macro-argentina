@@ -1,17 +1,14 @@
 """
-Pipeline V17 - Dashboard Macro Argentina
+Pipeline V18 - Dashboard Macro Argentina
 Corre una vez por día vía GitHub Actions.
 
-Cambios vs V16:
-- Gemini 2.5 Flash: thinkingBudget=0 + maxOutputTokens=8192 (fix del error silencioso de thinking)
-- Cálculo de salario real = RIPTE deflactado por IPC acumulado
-- Series de últimos 12 meses (IPC, EMAE, salario real) guardadas como JSON para sparklines
-- 4 prompts separados al LLM:
-    1. resumen diario (mundo/argentina/a_mirar) basado en noticias
-    2. análisis valor real MENSUAL
-    3. análisis valor real ANUAL
-    4. lectura macro (relaciones entre IPC/EMAE/salario real)
-- EMAE/RIPTE tolerantes a delay: se aceptan datos de hasta 90 días atrás
+Cambios vs V17:
+- EMAE y Salarios desde apis.datos.gob.ar (la de argentinadatos no los tiene)
+    * EMAE: serie 143.3_NO_PR_2004_A_21 (nivel general desestacionalizado, base 2004=100)
+    * Salarios: serie 152.1_INDICE_SIRS_0_M_18 (Índice de Salarios Total, INDEC)
+- Salario real calculado como índice deflactado por IPC
+- Prompts a Gemini optimizados para evitar fallos (menos noticias, output más chico)
+- Log más detallado del finishReason cuando Gemini falla
 """
 
 import os
@@ -27,7 +24,7 @@ from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 
 print("=" * 60)
-print("Pipeline V17 - Iniciando")
+print("Pipeline V18 - Iniciando")
 print(f"Fecha corrida: {datetime.now(timezone.utc).isoformat()}")
 print("=" * 60)
 
@@ -102,21 +99,50 @@ def get_historical_value(df, col, days_back):
 
 
 # ---------------------------------------------------------------
-# 1. DATOS MACRO
+# FUENTE NUEVA: apis.datos.gob.ar (Series de Tiempo INDEC)
 # ---------------------------------------------------------------
-print("\n[1/8] Ingesta macro Argentina...")
+def fetch_indec_series(serie_id, col_name, limit=500):
+    """
+    Consume la API oficial datos.gob.ar.
+    Doc: https://apis.datos.gob.ar/series/api/series/
+    Devuelve DataFrame con columnas 'fecha' y col_name, ordenado ascendente.
+    """
+    url = f"https://apis.datos.gob.ar/series/api/series/?ids={serie_id}&limit={limit}&format=json&sort=asc"
+    try:
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+        if r.status_code != 200:
+            print(f"  ⚠ HTTP {r.status_code} serie {serie_id}")
+            return pd.DataFrame(columns=["fecha", col_name])
+        data = r.json()
+        # La API devuelve {"data": [[fecha, valor], [fecha, valor], ...]}
+        rows = data.get("data", [])
+        if not rows:
+            print(f"  ⚠ Serie {serie_id}: sin datos en respuesta")
+            return pd.DataFrame(columns=["fecha", col_name])
+        df = pd.DataFrame(rows, columns=["fecha", col_name])
+        df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
+        df[col_name] = pd.to_numeric(df[col_name], errors="coerce")
+        df = df.dropna(subset=["fecha", col_name]).sort_values("fecha").reset_index(drop=True)
+        return df
+    except Exception as e:
+        print(f"  ⚠ Error fetch serie {serie_id}: {e}")
+        return pd.DataFrame(columns=["fecha", col_name])
 
-endpoints = {
+
+# ---------------------------------------------------------------
+# 1. DATOS MACRO (argentinadatos.com para lo que sí tiene)
+# ---------------------------------------------------------------
+print("\n[1/8] Ingesta macro Argentina (argentinadatos.com)...")
+
+endpoints_argdatos = {
     "oficial": ("https://api.argentinadatos.com/v1/cotizaciones/dolares/oficial", "venta", "USD_Oficial"),
     "blue": ("https://api.argentinadatos.com/v1/cotizaciones/dolares/blue", "venta", "USD_Blue"),
     "rp": ("https://api.argentinadatos.com/v1/finanzas/indices/riesgo-pais", "valor", "Riesgo_Pais"),
     "ipc": ("https://api.argentinadatos.com/v1/finanzas/indices/inflacion", "valor", "IPC"),
-    "emae": ("https://api.argentinadatos.com/v1/finanzas/indices/emae", "valor", "EMAE"),
-    "ripte": ("https://api.argentinadatos.com/v1/finanzas/indices/ripte", "valor", "RIPTE"),
 }
 
 macro_dfs = {}
-for key, (url, src_col, dest_col) in endpoints.items():
+for key, (url, src_col, dest_col) in endpoints_argdatos.items():
     raw = fetch_json(url)
     df = pd.DataFrame(raw)
     if not df.empty and "fecha" in df.columns:
@@ -131,13 +157,36 @@ for key, (url, src_col, dest_col) in endpoints.items():
 
 
 # ---------------------------------------------------------------
-# 2. IPC: mensual, interanual compuesto, aceleración + serie 12m
+# 2. EMAE + SALARIOS desde datos.gob.ar
 # ---------------------------------------------------------------
-print("\n[2/8] IPC: mensual / interanual / aceleración / serie 12m...")
+print("\n[2/8] EMAE y Salarios desde apis.datos.gob.ar...")
+
+# EMAE nivel general desestacionalizado, base 2004=100
+EMAE_SERIE_ID = "143.3_NO_PR_2004_A_21"
+df_emae_raw = fetch_indec_series(EMAE_SERIE_ID, "EMAE")
+if not df_emae_raw.empty:
+    print(f"  ✓ EMAE: {len(df_emae_raw)} filas, último {df_emae_raw['fecha'].max().date()}, último valor {df_emae_raw['EMAE'].iloc[-1]}")
+else:
+    print(f"  ✗ EMAE: sin datos")
+macro_dfs["emae"] = df_emae_raw
+
+# Índice de Salarios total, INDEC (mensual)
+SALARIOS_SERIE_ID = "152.1_INDICE_SIRS_0_M_18"
+df_salarios_raw = fetch_indec_series(SALARIOS_SERIE_ID, "IndiceSalarios")
+if not df_salarios_raw.empty:
+    print(f"  ✓ Salarios: {len(df_salarios_raw)} filas, último {df_salarios_raw['fecha'].max().date()}, último valor {df_salarios_raw['IndiceSalarios'].iloc[-1]}")
+else:
+    print(f"  ✗ Salarios: sin datos")
+macro_dfs["salarios"] = df_salarios_raw
+
+
+# ---------------------------------------------------------------
+# 3. IPC: mensual, interanual compuesto, aceleración + serie 12m
+# ---------------------------------------------------------------
+print("\n[3/8] IPC: métricas derivadas...")
 
 
 def ipc_serie_12m(df_ipc):
-    """Últimos 12 valores mensuales con fechas. Devuelve (fechas, valores)."""
     try:
         s = df_ipc.tail(12)
         return (s["fecha"].dt.strftime("%b %y").tolist(),
@@ -172,24 +221,23 @@ def ipc_aceleracion_pp(df_ipc):
         return None
 
 
-df_ipc_raw = macro_dfs["ipc"]
-ipc_mes = ipc_mensual_ultimo(df_ipc_raw) if not df_ipc_raw.empty else None
-ipc_yoy = ipc_interanual(df_ipc_raw, 12) if not df_ipc_raw.empty else None
-ipc_accel = ipc_aceleracion_pp(df_ipc_raw) if not df_ipc_raw.empty else None
-ipc_fechas_12m, ipc_valores_12m = ipc_serie_12m(df_ipc_raw) if not df_ipc_raw.empty else ([], [])
+df_ipc = macro_dfs["ipc"]
+ipc_mes = ipc_mensual_ultimo(df_ipc) if not df_ipc.empty else None
+ipc_yoy = ipc_interanual(df_ipc, 12) if not df_ipc.empty else None
+ipc_accel = ipc_aceleracion_pp(df_ipc) if not df_ipc.empty else None
+ipc_fechas_12m, ipc_valores_12m = ipc_serie_12m(df_ipc) if not df_ipc.empty else ([], [])
 
 accel_str = f"{ipc_accel:+.2f}pp" if ipc_accel is not None else "N/D"
-print(f"  ✓ IPC último: {ipc_mes}% | YoY: {ipc_yoy}% | Acel: {accel_str} | Serie: {len(ipc_valores_12m)} meses")
+print(f"  ✓ IPC último: {ipc_mes}% | YoY: {ipc_yoy}% | Acel: {accel_str}")
 
 
 # ---------------------------------------------------------------
-# 3. EMAE + SALARIO REAL + series 12m
+# 4. EMAE derivado + serie 12m
 # ---------------------------------------------------------------
-print("\n[3/8] EMAE y Salario Real...")
+print("\n[4/8] EMAE derivados...")
 
 
-def serie_12m_generica(df, col):
-    """Últimos 12 valores + fechas de cualquier serie macro."""
+def serie_12m(df, col):
     try:
         s = df.tail(12)
         return (s["fecha"].dt.strftime("%b %y").tolist(),
@@ -198,100 +246,79 @@ def serie_12m_generica(df, col):
         return [], []
 
 
-# EMAE
-df_emae_raw = macro_dfs["emae"]
 emae_val = None
 emae_yoy = None
 emae_fechas_12m, emae_valores_12m = [], []
 emae_age_days = None
 
 if not df_emae_raw.empty:
-    df_emae = df_emae_raw.copy()
-    df_emae["EMAE"] = pd.to_numeric(df_emae["EMAE"], errors="coerce")
-    df_emae = df_emae.dropna(subset=["EMAE"])
-    if not df_emae.empty:
-        emae_val = float(df_emae["EMAE"].iloc[-1])
-        last_date = df_emae["fecha"].iloc[-1]
-        emae_age_days = (pd.Timestamp.now() - last_date).days
-
-        # YoY: comparar con dato de hace ~365 días
-        ant_idx = df_emae[df_emae["fecha"] <= (last_date - timedelta(days=330))]
-        if not ant_idx.empty:
-            emae_yoy = round(pct_change(emae_val, ant_idx["EMAE"].iloc[-1]), 2)
-
-        emae_fechas_12m, emae_valores_12m = serie_12m_generica(df_emae, "EMAE")
+    emae_val = float(df_emae_raw["EMAE"].iloc[-1])
+    last_date = df_emae_raw["fecha"].iloc[-1]
+    emae_age_days = (pd.Timestamp.now() - last_date).days
+    # YoY: comparar con valor ~12 meses atrás
+    target = last_date - timedelta(days=330)
+    ant = df_emae_raw[df_emae_raw["fecha"] <= target]
+    if not ant.empty:
+        emae_yoy = round(pct_change(emae_val, ant["EMAE"].iloc[-1]), 2)
+    emae_fechas_12m, emae_valores_12m = serie_12m(df_emae_raw, "EMAE")
 
 print(f"  ✓ EMAE: val={emae_val} | YoY={emae_yoy}% | age={emae_age_days}d | serie {len(emae_valores_12m)} puntos")
 
 
-# Salario real: RIPTE deflactado por IPC acumulado
-# Metodología:
-#   ipc_base_t = (1 + ipc_1)*(1 + ipc_2)*... *(1 + ipc_t) * 100   [base 100 en t=0]
-#   salario_real_t = (RIPTE_t / RIPTE_0) / (ipc_base_t / 100) * 100
-# O de forma equivalente: tomamos RIPTE a pesos de hoy dividido por factor de inflación.
-print("\n  Calculando salario real base 100...")
+# ---------------------------------------------------------------
+# 5. SALARIO REAL: Índice de Salarios deflactado por IPC
+# ---------------------------------------------------------------
+print("\n[5/8] Salario real (base 100 hace 12 meses)...")
 
-df_ripte_raw = macro_dfs["ripte"]
 salario_real_yoy = None
-salario_real_valores = []
 salario_real_fechas = []
+salario_real_valores = []
 salario_real_age_days = None
 
-if not df_ripte_raw.empty and not df_ipc_raw.empty:
-    df_r = df_ripte_raw.copy()
-    df_r["RIPTE"] = pd.to_numeric(df_r["RIPTE"], errors="coerce")
-    df_r = df_r.dropna(subset=["RIPTE"]).sort_values("fecha").reset_index(drop=True)
+if not df_salarios_raw.empty and not df_ipc.empty:
+    # Alinear por mes-año
+    df_s = df_salarios_raw.copy()
+    df_s["ym"] = df_s["fecha"].dt.to_period("M")
+    df_s = df_s.drop_duplicates(subset=["ym"], keep="last")
 
-    df_i = df_ipc_raw.copy()
-    df_i["IPC"] = pd.to_numeric(df_i["IPC"], errors="coerce")
-    df_i = df_i.dropna(subset=["IPC"]).sort_values("fecha").reset_index(drop=True)
-
-    # Alinear mes a mes (aproximando por mes-año)
-    df_r["ym"] = df_r["fecha"].dt.to_period("M")
+    df_i = df_ipc.copy()
     df_i["ym"] = df_i["fecha"].dt.to_period("M")
-    df_r = df_r.drop_duplicates(subset=["ym"], keep="last")
     df_i = df_i.drop_duplicates(subset=["ym"], keep="last")
 
-    merged = df_r.merge(df_i[["ym", "IPC"]], on="ym", how="inner").sort_values("ym")
+    merged = df_s.merge(df_i[["ym", "IPC"]], on="ym", how="inner").sort_values("ym")
 
-    if len(merged) >= 12:
-        # base 100 hace 12 meses desde el último dato de RIPTE disponible
-        ultimos_12 = merged.tail(13)  # 13 para tener "hace 12" + los 12 siguientes
-        if len(ultimos_12) >= 12:
-            base_idx = ultimos_12.iloc[0]
-            ripte_base = base_idx["RIPTE"]
+    if len(merged) >= 13:
+        # Tomamos los últimos 13 (base + 12 siguientes)
+        slice_ = merged.tail(13).reset_index(drop=True)
+        base_salario = slice_.iloc[0]["IndiceSalarios"]
+        factor_ipc = 1.0
+        for i in range(1, len(slice_)):
+            factor_ipc *= (1 + slice_.iloc[i]["IPC"] / 100)
+            salario_nominal_idx = slice_.iloc[i]["IndiceSalarios"] / base_salario
+            salario_real = salario_nominal_idx / factor_ipc * 100
+            salario_real_valores.append(round(salario_real, 2))
+            salario_real_fechas.append(slice_.iloc[i]["ym"].strftime("%b %y"))
 
-            # Factor de inflación acumulado desde base
-            valores = []
-            fechas = []
-            factor = 1.0
-            for i, row in ultimos_12.iloc[1:].iterrows():
-                factor *= (1 + row["IPC"] / 100)
-                salario_real = (row["RIPTE"] / ripte_base) / factor * 100
-                valores.append(round(salario_real, 2))
-                fechas.append(row["ym"].strftime("%b %y"))
-
-            salario_real_fechas = fechas
-            salario_real_valores = valores
-            salario_real_yoy = round(valores[-1] - 100, 2)  # variación vs base 100
-            salario_real_age_days = (pd.Timestamp.now() - df_r["fecha"].iloc[-1]).days
+        if salario_real_valores:
+            salario_real_yoy = round(salario_real_valores[-1] - 100, 2)
+        salario_real_age_days = (pd.Timestamp.now() - df_salarios_raw["fecha"].iloc[-1]).days
 
 print(f"  ✓ Salario real: YoY={salario_real_yoy}% | age={salario_real_age_days}d | serie {len(salario_real_valores)} puntos")
 
 
 # ---------------------------------------------------------------
-# 4. BENCHMARK VALOR REAL USD
+# 6. BENCHMARK VALOR REAL USD
 # ---------------------------------------------------------------
-print("\n[4/8] Benchmark valor real USD...")
+print("\n[6/8] Benchmark valor real USD...")
 
 
 def get_bench(months):
     try:
-        df_ipc = macro_dfs["ipc"]
+        df_ipc_b = macro_dfs["ipc"]
         df_of = macro_dfs["oficial"]
-        if df_ipc.empty or df_of.empty:
+        if df_ipc_b.empty or df_of.empty:
             return None
-        ipc_hist = df_ipc["IPC"].astype(float).tail(months) / 100
+        ipc_hist = df_ipc_b["IPC"].astype(float).tail(months) / 100
         ipc_acc = (1 + ipc_hist).prod() - 1
         usd_hoy = float(df_of["USD_Oficial"].iloc[-1])
         target_date = HOY - timedelta(days=30 * months)
@@ -312,9 +339,9 @@ print(f"  ✓ Benchmark 1M: {bench_1m}% | 1A: {bench_1a}%")
 
 
 # ---------------------------------------------------------------
-# 5. MERCADOS
+# 7. MERCADOS + CONSOLIDACIÓN
 # ---------------------------------------------------------------
-print("\n[5/8] Ingesta mercados...")
+print("\n[7/8] Mercados y consolidación...")
 
 tickers = {
     "SP500": "^GSPC",
@@ -343,14 +370,10 @@ if not df_m.empty:
     df_m = df_m.reset_index().rename(columns={"Date": "fecha"})
     df_m["fecha"] = pd.to_datetime(df_m["fecha"]).dt.tz_localize(None)
 
-
-# ---------------------------------------------------------------
-# 6. CONSOLIDACIÓN + CCL + BRECHA
-# ---------------------------------------------------------------
-print("\n[6/8] Consolidación...")
-
 df_final = df_m.copy()
-for key, df in macro_dfs.items():
+# Mergeamos los que van en df_final (mercados + indicadores con frecuencia diaria/mensual)
+for key in ["oficial", "blue", "rp", "ipc"]:
+    df = macro_dfs.get(key, pd.DataFrame())
     if not df.empty:
         df_final = df_final.merge(df, on="fecha", how="outer")
 
@@ -369,9 +392,9 @@ print(f"  ✓ df_final: {len(df_final)} filas, {len(df_final.columns)} columnas"
 
 
 # ---------------------------------------------------------------
-# 7. NOTICIAS (RSS)
+# 8. NOTICIAS RSS + SNAPSHOTS + PROMPTS GEMINI
 # ---------------------------------------------------------------
-print("\n[7/8] Ingesta noticias...")
+print("\n[8/8] Noticias + Gemini...")
 
 RSS_SOURCES = {
     "Ámbito": "https://www.ambito.com/rss/pages/economia.xml",
@@ -436,7 +459,7 @@ for medio, url in RSS_SOURCES.items():
             if horas > 48:
                 continue
             titulo = e.get("title", "").strip()
-            resumen = e.get("summary", "").strip()[:300]
+            resumen = e.get("summary", "").strip()[:250]
             resumen = resumen.replace("<p>", "").replace("</p>", "").replace("&nbsp;", " ")
             noticias.append({
                 "medio": medio,
@@ -451,14 +474,8 @@ for medio, url in RSS_SOURCES.items():
         print(f"  ✗ {medio}: {ex}")
 
 noticias = sorted(noticias, key=lambda x: x["score"], reverse=True)
-top15 = noticias[:15]
-print(f"  → Total noticias: {len(noticias)} | Top 15 al LLM")
-
-
-# ---------------------------------------------------------------
-# 8. SNAPSHOTS + RENDIMIENTOS VALOR REAL
-# ---------------------------------------------------------------
-print("\n[8/8] Snapshots y llamadas Gemini...")
+top_noticias_llm = noticias[:8]  # reducido de 15 a 8 para no saturar el prompt
+print(f"  → Total: {len(noticias)} | Top 8 al LLM")
 
 
 def snapshot_ratio(col):
@@ -586,147 +603,118 @@ def build_prompt_resumen():
     def fmt_ratio(label, s, prefix=""):
         if not s:
             return f"- {label}: sin datos"
-        return f"- {label}: {prefix}{s['val']} | 1D: {s['d1']:+.2f}% | 1M: {s['m1']:+.2f}% | 1A: {s['a1']:+.2f}%"
+        return f"- {label}: {prefix}{s['val']} (1M: {s['m1']:+.1f}%, 1A: {s['a1']:+.1f}%)"
 
     def fmt_pp(label, s, suffix="%"):
         if not s:
             return f"- {label}: sin datos"
-        return f"- {label}: {s['val']:.2f}{suffix} | 1M: {s['m1']:+.2f}pp | 1A: {s['a1']:+.2f}pp"
+        return f"- {label}: {s['val']:.1f}{suffix} (1M: {s['m1']:+.1f}pp)"
 
     def fmt_pts(label, s):
         if not s:
             return f"- {label}: sin datos"
-        return f"- {label}: {s['val']:.0f} bps | 1M: {s['m1']:+.0f} bps | 1A: {s['a1']:+.0f} bps"
+        return f"- {label}: {s['val']:.0f} bps (1M: {s['m1']:+.0f})"
 
     bloque_mundo = "\n".join([
         fmt_ratio("S&P 500", snapshots["sp500"]),
-        fmt_ratio("Brent", snapshots["brent"], prefix="USD "),
-        fmt_ratio("Bitcoin", snapshots["btc"], prefix="USD "),
-        fmt_ratio("Oro", snapshots["oro"], prefix="USD "),
+        fmt_ratio("Brent", snapshots["brent"], "USD "),
+        fmt_ratio("Bitcoin", snapshots["btc"], "USD "),
+        fmt_ratio("Oro", snapshots["oro"], "USD "),
     ])
 
     ipc_line = (
-        f"- IPC último mes: {ipc_mes}% | Interanual: {ipc_yoy}% | Aceleración vs mes previo: {ipc_accel:+.2f}pp"
-        if ipc_mes is not None and ipc_accel is not None
-        else "- IPC: sin datos completos"
+        f"- IPC: {ipc_mes}% mensual, {ipc_yoy}% interanual"
+        if ipc_mes is not None
+        else "- IPC: sin datos"
     )
 
     bloque_ar = "\n".join([
         fmt_ratio("Merval", snapshots["merval"]),
-        fmt_ratio("AL30", snapshots["al30"]),
-        fmt_ratio("Dólar oficial", snapshots["usd_oficial"], prefix="$"),
-        fmt_ratio("CCL", snapshots["ccl"], prefix="$"),
+        fmt_ratio("Dólar oficial", snapshots["usd_oficial"], "$"),
         fmt_pp("Brecha CCL", snapshots["brecha_ccl"]),
         fmt_pts("Riesgo País", snapshots["riesgo_pais"]),
         ipc_line,
     ])
 
     noticias_txt = "\n".join([
-        f"[{n['medio']}] {n['titulo']}\n  → {n['resumen'][:180]}"
-        for n in top15
-    ]) if top15 else "(sin noticias disponibles)"
+        f"[{n['medio']}] {n['titulo']}"
+        for n in top_noticias_llm
+    ]) if top_noticias_llm else "(sin noticias)"
 
-    return f"""Sos un analista financiero argentino escribiendo un resumen matutino para un inversor. Hoy es {HOY.strftime('%d/%m/%Y')}.
+    return f"""Analista financiero argentino. Fecha: {HOY.strftime('%d/%m/%Y')}.
 
-=== DATOS DE MERCADO (contexto, NO los cites a menos que sea imprescindible) ===
-
-MUNDO:
+DATOS MUNDO:
 {bloque_mundo}
 
-ARGENTINA:
+DATOS ARGENTINA:
 {bloque_ar}
 
-=== NOTICIAS DE MEDIOS ARGENTINOS (últimas 48h, ordenadas por relevancia) ===
-
+NOTICIAS TOP (últimas 48h):
 {noticias_txt}
 
-=== TU TAREA ===
-
-Escribí un resumen en 3 líneas. Las 3 líneas deben basarse en lo que dicen las NOTICIAS de arriba, no en tu interpretación de los números.
-
-Devolvé JSON:
-
+Devolvé JSON con resumen basado en las NOTICIAS (no en los datos):
 {{
-  "mundo": "una línea basada en noticias internacionales, con tema concreto. Máximo 180 caracteres.",
-  "argentina": "una línea basada en noticias argentinas, con tema/evento concreto. Máximo 180 caracteres.",
-  "a_mirar": "evento concreto de los próximos días SOLO si aparece mencionado en alguna noticia. Si no hay nada, 'Sin eventos destacados en la agenda'. Máximo 180 caracteres.",
+  "mundo": "una línea sobre contexto global mencionando tema concreto de las noticias. Máximo 160 caracteres.",
+  "argentina": "una línea sobre Argentina mencionando tema concreto de las noticias. Máximo 160 caracteres.",
+  "a_mirar": "evento concreto próximos días SOLO si aparece en las noticias. Si no, 'Sin eventos destacados'. Máximo 160 caracteres.",
   "noticias_destacadas": [
-    {{"titular": "exacto del listado", "medio": "exacto", "url": "exacto", "por_que_importa": "una línea 100 caracteres"}},
+    {{"titular": "exacto", "medio": "exacto", "url": "exacta", "por_que_importa": "80 caracteres máx"}},
     {{"titular": "...", "medio": "...", "url": "...", "por_que_importa": "..."}},
     {{"titular": "...", "medio": "...", "url": "...", "por_que_importa": "..."}}
   ]
 }}
 
-REGLAS: no inventes datos/noticias, no recomiendes compra/venta, no predigas, español rioplatense, sin emojis, JSON puro sin markdown."""
+REGLAS: no inventes, no recomiendes comprar/vender, no predigas. Español rioplatense, sin emojis, JSON sin markdown."""
 
 
 def build_prompt_valor_real(rendimientos, bench, periodo_label):
     def fmt_dict(d):
         return "\n".join([
-            f"  - {k}: {v:+.2f}%" if v is not None else f"  - {k}: sin datos"
+            f"  {k}: {v:+.2f}%" if v is not None else f"  {k}: sin datos"
             for k, v in d.items()
         ])
 
     bench_str = f"{bench:+.2f}" if bench is not None else "0.00"
 
-    return f"""Sos un analista financiero argentino. Un dashboard muestra rendimientos {periodo_label.lower()} de inversiones medidos en USD:
+    return f"""Analista financiero argentino. Dashboard muestra rendimientos {periodo_label.lower()} de inversiones en USD:
 
 {fmt_dict(rendimientos)}
 
-Benchmark "dólares quietos": {bench_str}%
-(positivo = Argentina se encareció, dólares quietos perdieron poder de compra)
-(negativo = Argentina se abarató, dólares quietos ganaron poder de compra)
+Benchmark dólares quietos: {bench_str}%
+(positivo = Argentina se encareció, dólares quietos perdieron)
+(negativo = Argentina se abarató, dólares quietos ganaron)
 
-=== TU TAREA ===
+Explicá en 3 oraciones qué pasó:
+1. Qué significa el benchmark de {bench_str}% para alguien con dólares en Argentina (período: {periodo_label.lower()}).
+2. Qué activo quedó más arriba y cuál más abajo vs benchmark.
+3. Observación objetiva del patrón, sin predicciones.
 
-Explicá en 3 oraciones qué pasó con estos activos en este período:
-- Frase 1: qué significa el benchmark de {bench_str}% para alguien con dólares en Argentina (período: {periodo_label.lower()}).
-- Frase 2: qué activo quedó más arriba y cuál más abajo respecto del benchmark.
-- Frase 3: observación objetiva sobre el patrón visible, sin predicciones ni consejos.
+Devolvé JSON: {{"analisis": "párrafo de 3 oraciones, máximo 500 caracteres"}}
 
-Devolvé JSON:
-{{"analisis": "párrafo corrido de 3 oraciones, máximo 500 caracteres"}}
-
-REGLAS: no recomiendes, no predigas, usá solo los números de arriba, español rioplatense, sin emojis, JSON puro."""
+REGLAS: no recomiendes, no predigas, usá solo estos números, español rioplatense, sin emojis, JSON puro."""
 
 
 def build_prompt_lectura_macro():
-    """Lectura transversal de IPC + EMAE + salario real."""
-    ipc_series_str = ", ".join([f"{f}: {v}%" for f, v in zip(ipc_fechas_12m, ipc_valores_12m)]) if ipc_valores_12m else "sin datos"
-    emae_series_str = ", ".join([f"{f}: {v}" for f, v in zip(emae_fechas_12m, emae_valores_12m)]) if emae_valores_12m else "sin datos"
-    sal_series_str = ", ".join([f"{f}: {v}" for f, v in zip(salario_real_fechas, salario_real_valores)]) if salario_real_valores else "sin datos"
+    ipc_series = ", ".join([f"{f}:{v}%" for f, v in zip(ipc_fechas_12m, ipc_valores_12m)]) if ipc_valores_12m else "sin datos"
+    emae_series = ", ".join([f"{f}:{v}" for f, v in zip(emae_fechas_12m, emae_valores_12m)]) if emae_valores_12m else "sin datos"
+    sal_series = ", ".join([f"{f}:{v}" for f, v in zip(salario_real_fechas, salario_real_valores)]) if salario_real_valores else "sin datos"
 
-    return f"""Sos un analista económico argentino. El dashboard muestra tres series macroeconómicas de los últimos 12 meses:
+    return f"""Analista económico argentino. Series macro últimos 12 meses:
 
-1. IPC MENSUAL (% de inflación cada mes):
-   {ipc_series_str}
-   Último mes: {ipc_mes}% | Interanual compuesto: {ipc_yoy}%
+1. IPC MENSUAL: {ipc_series}
+   Último: {ipc_mes}% | Interanual: {ipc_yoy}%
 
-2. EMAE (índice de actividad económica, mensual):
-   {emae_series_str}
-   Último valor: {emae_val} | Variación interanual: {emae_yoy}%
+2. EMAE (actividad económica): {emae_series}
+   Último: {emae_val} | YoY: {emae_yoy}%
 
-3. SALARIO REAL (base 100 hace 12 meses, mensual):
-   {sal_series_str}
-   Variación interanual: {salario_real_yoy}%
-   (base 100: valores >100 = salarios le ganaron a la inflación, <100 = perdieron)
+3. SALARIO REAL (base 100 hace 12m): {sal_series}
+   YoY: {salario_real_yoy}% (valores >100 = salarios le ganaron a inflación)
 
-=== TU TAREA ===
+Lectura transversal en 2-3 oraciones. Relacioná las variables: qué se mueve junto, qué se desacopla, qué tendencia es clara.
 
-Escribí una lectura transversal de 2-3 oraciones que relacione las tres variables. Qué se mueve junto, qué se desacopla, qué tendencia es clara.
+Devolvé JSON: {{"lectura_macro": "párrafo de 2-3 oraciones, máximo 400 caracteres"}}
 
-Devolvé JSON:
-{{"lectura_macro": "párrafo de 2-3 oraciones, máximo 400 caracteres"}}
-
-REGLAS:
-- Basate SOLO en los datos de arriba. No inventes números.
-- NO hagas predicciones ni digas "se espera que...".
-- NO des consejos ni opiniones políticas.
-- NO recomiendes acciones.
-- Lectura fría, objetiva, tipo informe técnico.
-- Español rioplatense, directo, sin jerga.
-- Sin emojis.
-- JSON puro sin markdown."""
+REGLAS: solo datos de arriba, no inventes, no predigas, no opines política, lectura objetiva, español rioplatense, sin emojis, JSON puro."""
 
 
 def llamar_gemini(prompt, intentos=3, model=GEMINI_MODEL):
@@ -736,22 +724,26 @@ def llamar_gemini(prompt, intentos=3, model=GEMINI_MODEL):
         "generationConfig": {
             "response_mime_type": "application/json",
             "temperature": 0.3,
-            "maxOutputTokens": 8192,
+            "maxOutputTokens": 4096,
             "thinkingConfig": {"thinkingBudget": 0},
         },
     }
+
+    prompt_size = len(prompt)
+
     for i in range(intentos):
         try:
             r = requests.post(url, json=payload, timeout=90)
             if r.status_code == 200:
                 data = r.json()
                 if "candidates" in data and data["candidates"]:
-                    finish = data["candidates"][0].get("finishReason", "")
-                    content = data["candidates"][0].get("content", {})
+                    cand = data["candidates"][0]
+                    finish = cand.get("finishReason", "unknown")
+                    content = cand.get("content", {})
                     parts = content.get("parts", [])
                     if parts and "text" in parts[0]:
                         return parts[0]["text"]
-                    print(f"  ⚠ Intento {i+1}: respuesta sin text. finish={finish}, content={str(content)[:200]}")
+                    print(f"  ⚠ Intento {i+1}: prompt_size={prompt_size}, finish={finish}, sin text en parts")
                 else:
                     print(f"  ⚠ Intento {i+1}: sin candidates. {str(data)[:300]}")
             else:
@@ -759,6 +751,7 @@ def llamar_gemini(prompt, intentos=3, model=GEMINI_MODEL):
         except Exception as e:
             print(f"  ⚠ Intento {i+1}: {e}")
         time.sleep(5)
+    print(f"  ✗ Gemini falló tras {intentos} intentos. Tamaño del prompt: {prompt_size} chars.")
     return None
 
 
@@ -773,18 +766,16 @@ def parsear_json(texto):
         try:
             return json.loads(limpio)
         except json.JSONDecodeError as e:
-            print(f"  ⚠ JSON inválido: {e}")
-            print(f"  Texto: {texto[:400]}")
+            print(f"  ⚠ JSON inválido: {e}. Texto: {texto[:400]}")
             return None
 
 
-# Llamada 1: resumen diario
-print("\n  → Llamada 1/4: Gemini resumen diario...")
+print("\n  → Llamada 1/4: resumen diario...")
 resp_resumen = parsear_json(llamar_gemini(build_prompt_resumen())) or {}
 if resp_resumen:
     print("    ✓ OK")
 else:
-    print("    ✗ Falló")
+    print("    ✗ Fallback")
     resp_resumen = {
         "mundo": "Sin análisis disponible",
         "argentina": "Sin análisis disponible",
@@ -792,20 +783,17 @@ else:
         "noticias_destacadas": [],
     }
 
-# Llamada 2: análisis valor real mensual
-print("  → Llamada 2/4: Gemini análisis valor real MENSUAL...")
+print("  → Llamada 2/4: valor real MENSUAL...")
 resp_vr_1m = parsear_json(llamar_gemini(build_prompt_valor_real(valor_real_1m, bench_1m, "Mensual"))) or {}
 analisis_vr_1m = resp_vr_1m.get("analisis", "Sin análisis disponible")
 print(f"    ✓" if resp_vr_1m else "    ✗")
 
-# Llamada 3: análisis valor real anual
-print("  → Llamada 3/4: Gemini análisis valor real ANUAL...")
+print("  → Llamada 3/4: valor real ANUAL...")
 resp_vr_1a = parsear_json(llamar_gemini(build_prompt_valor_real(valor_real_1a, bench_1a, "Anual"))) or {}
 analisis_vr_1a = resp_vr_1a.get("analisis", "Sin análisis disponible")
 print(f"    ✓" if resp_vr_1a else "    ✗")
 
-# Llamada 4: lectura macro
-print("  → Llamada 4/4: Gemini lectura macro...")
+print("  → Llamada 4/4: lectura macro...")
 resp_macro = parsear_json(llamar_gemini(build_prompt_lectura_macro())) or {}
 lectura_macro = resp_macro.get("lectura_macro", "Sin análisis disponible")
 print(f"    ✓" if resp_macro else "    ✗")
@@ -865,5 +853,5 @@ if noticias:
     print(f"  ✓ DB_Noticias: {len(df_news)} noticias")
 
 print("\n" + "=" * 60)
-print("Pipeline V17 - Completado")
+print("Pipeline V18 - Completado")
 print("=" * 60)
