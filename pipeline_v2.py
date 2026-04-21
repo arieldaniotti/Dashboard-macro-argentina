@@ -1,20 +1,3 @@
-"""
-Pipeline V20 - Dashboard Macro Argentina
-Corre una vez por día vía GitHub Actions.
-
-Cambios vs V19:
-- Fix 1D: ahora usa el último día hábil distinto (no exige "ayer exacto") → siempre hay delta 1D
-- Fix Salario Real: fallback en cascada (RIPTE → Indice Salarios → Salario Privado Registrado)
-- Fix EMAE prompt: pasamos explícito el signo del YoY y le decimos al LLM que NO invierta
-- Fix Macro Global: parser FRED robusto + validación de último valor actualizado
-- Fix "a_mirar" LLM: prompt nuevo que pide catalizadores probables si no hay agenda dura
-- Fix noticias: scoring más estricto (sólo pasan las que tienen ≥2 keywords capa alta o 1 combo)
-- Ratio dólar futuro 12m/spot + devaluación anualizada (reemplaza tasa plazo fijo en expectativas)
-- Escrituras CABA+CBA: variación vs 6 meses atrás y vs 12 meses (no gráficos)
-- Inmobiliario: se eliminaron series M² y gráfico escrituras, se mantienen tarjetas
-- Sacamos gráfico de evolución m² y de escrituras
-"""
-
 import os
 import json
 import time
