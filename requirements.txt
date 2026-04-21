@@ -6,3 +6,4 @@ gspread>=6.0.0
 google-auth>=2.27.0
 streamlit>=1.30.0
 plotly>=5.18.0
+beautifulsoup4
