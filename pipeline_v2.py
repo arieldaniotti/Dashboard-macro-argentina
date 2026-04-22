@@ -6,28 +6,36 @@ import feedparser
 import yfinance as yf
 import pandas as pd
 import gspread
-from bs4 import BeautifulSoup
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
+from io import StringIO
 
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 print("=" * 60)
-print("Pipeline V20 - Iniciando")
+print("Pipeline V21 - Iniciando")
 print(f"Fecha corrida: {datetime.now(timezone.utc).isoformat()}")
 print("=" * 60)
 
 # ---------------------------------------------------------------
-# CONFIG
+# CONFIG - SECRETS
 # ---------------------------------------------------------------
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 GCP_JSON = os.environ.get("GCLOUD_SERVICE_ACCOUNT")
-GEMINI_MODEL = "gemini-2.5-flash"
+FRED_API_KEY = os.environ.get("FRED_API_KEY", "")
+CHILE_USER = os.environ.get("CHILE_USER", "")
+CHILE_PASS = os.environ.get("CHILE_PASS", "")
+ROFEX_USER = os.environ.get("ROFEX_USER", "")
+ROFEX_PASS = os.environ.get("ROFEX_PASS", "")
+SHEET_NAME = os.environ.get("SHEET_NAME", "Dashboard Macro")
+
+GEMINI_MODEL_FLASH = "gemini-2.5-flash"
+GEMINI_MODEL_PRO = "gemini-2.5-pro"  # Más robusto para el flash market que fallaba
 
 if not GEMINI_API_KEY or not GCP_JSON:
-    raise RuntimeError("Faltan secrets: GEMINI_API_KEY o GCLOUD_SERVICE_ACCOUNT")
+    raise RuntimeError("Faltan secrets críticos: GEMINI_API_KEY o GCLOUD_SERVICE_ACCOUNT")
 
 creds = Credentials.from_service_account_info(
     json.loads(GCP_JSON),
@@ -36,27 +44,42 @@ creds = Credentials.from_service_account_info(
         "https://www.googleapis.com/auth/drive",
     ],
 )
-sh = gspread.authorize(creds).open("Dashboard Macro")
+sh = gspread.authorize(creds).open(SHEET_NAME)
 
 HOY = datetime.today()
 HACE_1A = HOY - timedelta(days=365)
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (DashboardMacroAR/1.0)"}
+HEADERS = {"User-Agent": "Mozilla/5.0 (DashboardMacroAR/21)"}
 
 
 # ---------------------------------------------------------------
 # HELPERS GENERALES
 # ---------------------------------------------------------------
-def fetch_json(url, timeout=15, verify=True):
+def fetch_json(url, timeout=20, verify=True, headers=None):
     try:
-        r = requests.get(url, headers=HEADERS, timeout=timeout, verify=verify)
+        h = HEADERS.copy()
+        if headers:
+            h.update(headers)
+        r = requests.get(url, headers=h, timeout=timeout, verify=verify)
         if r.status_code == 200:
             return r.json()
         print(f"  ⚠ HTTP {r.status_code} en {url[:80]}")
-        return []
+        return None
     except Exception as e:
         print(f"  ⚠ Error fetch {url[:80]}: {e}")
-        return []
+        return None
+
+
+def fetch_csv(url, timeout=20):
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=timeout)
+        if r.status_code == 200:
+            return pd.read_csv(StringIO(r.text))
+        print(f"  ⚠ HTTP {r.status_code} CSV en {url[:80]}")
+        return pd.DataFrame()
+    except Exception as e:
+        print(f"  ⚠ Error fetch CSV: {e}")
+        return pd.DataFrame()
 
 
 def pct_change(new, old):
@@ -78,10 +101,6 @@ def abs_diff(new, old):
 
 
 def get_historical_value(df, col, days_back):
-    """
-    Busca el último valor anterior a (max_fecha - days_back).
-    FIX: Si no hay valor previo válido, devuelve None (no el primer valor de la serie).
-    """
     try:
         serie = df[["fecha", col]].copy()
         serie[col] = pd.to_numeric(serie[col], errors="coerce")
@@ -98,49 +117,37 @@ def get_historical_value(df, col, days_back):
 
 
 def get_last_distinct_trading_day_value(df, col):
-    """
-    FIX 1D: Devuelve el valor del último día hábil DISTINTO al actual.
-    No exige que sea "ayer exacto" (cosa que falla los lunes porque viernes ≠ ayer).
-    Busca el último registro estrictamente anterior al máximo con valor no-nulo.
-    """
     try:
         serie = df[["fecha", col]].copy()
         serie[col] = pd.to_numeric(serie[col], errors="coerce")
         serie = serie.dropna(subset=[col]).drop_duplicates(subset=["fecha"]).sort_values("fecha")
         if len(serie) < 2:
             return None
-        # El "actual" es el último. El "previo" es el penúltimo con valor válido.
         return serie[col].iloc[-2]
     except Exception:
         return None
 
 
 def fetch_indec_series(serie_id, col_name, limit=500):
+    """API datos.gob.ar - sigue funcionando para EMAE."""
     url = f"https://apis.datos.gob.ar/series/api/series/?ids={serie_id}&limit={limit}&format=json&sort=asc"
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=20)
-        if r.status_code != 200:
-            print(f"  ⚠ HTTP {r.status_code} serie {serie_id}")
-            return pd.DataFrame(columns=["fecha", col_name])
-        data = r.json()
-        rows = data.get("data", [])
-        if not rows:
-            print(f"  ⚠ Serie {serie_id}: sin datos")
-            return pd.DataFrame(columns=["fecha", col_name])
-        df = pd.DataFrame(rows, columns=["fecha", col_name])
-        df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
-        df[col_name] = pd.to_numeric(df[col_name], errors="coerce")
-        df = df.dropna(subset=["fecha", col_name]).sort_values("fecha").reset_index(drop=True)
-        return df
-    except Exception as e:
-        print(f"  ⚠ Error fetch serie {serie_id}: {e}")
+    data = fetch_json(url)
+    if not data:
         return pd.DataFrame(columns=["fecha", col_name])
+    rows = data.get("data", []) if isinstance(data, dict) else []
+    if not rows:
+        return pd.DataFrame(columns=["fecha", col_name])
+    df = pd.DataFrame(rows, columns=["fecha", col_name])
+    df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
+    df[col_name] = pd.to_numeric(df[col_name], errors="coerce")
+    df = df.dropna().sort_values("fecha").reset_index(drop=True)
+    return df
 
 
 # ---------------------------------------------------------------
-# 1. DATOS MACRO ARGENTINA
+# 1. MACRO ARGENTINA (argentinadatos.com)
 # ---------------------------------------------------------------
-print("\n[1/12] Ingesta macro Argentina (argentinadatos.com)...")
+print("\n[1/10] Macro Argentina (argentinadatos.com)...")
 
 endpoints_argdatos = {
     "oficial": ("https://api.argentinadatos.com/v1/cotizaciones/dolares/oficial", "venta", "USD_Oficial"),
@@ -152,64 +159,53 @@ endpoints_argdatos = {
 macro_dfs = {}
 for key, (url, src_col, dest_col) in endpoints_argdatos.items():
     raw = fetch_json(url)
-    df = pd.DataFrame(raw)
-    if not df.empty and "fecha" in df.columns:
-        df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
-        df = df.rename(columns={src_col: dest_col})
-        df = df[["fecha", dest_col]].dropna(subset=["fecha"]).sort_values("fecha")
-        macro_dfs[key] = df
-        print(f"  ✓ {dest_col}: {len(df)} filas, último {df['fecha'].max().date()}")
-    else:
-        print(f"  ✗ {dest_col}: sin datos")
-        macro_dfs[key] = pd.DataFrame(columns=["fecha", dest_col])
+    if raw:
+        df = pd.DataFrame(raw)
+        if not df.empty and "fecha" in df.columns:
+            df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
+            df = df.rename(columns={src_col: dest_col})
+            df = df[["fecha", dest_col]].dropna().sort_values("fecha")
+            macro_dfs[key] = df
+            print(f"  ✓ {dest_col}: {len(df)} filas, último {df['fecha'].max().date()}")
+            continue
+    macro_dfs[key] = pd.DataFrame(columns=["fecha", dest_col])
+    print(f"  ✗ {dest_col}: sin datos")
 
 
 # ---------------------------------------------------------------
-# 2. EMAE + SALARIO REAL (cascada de fallbacks)
+# 2. EMAE + RIPTE (CSV directo)
 # ---------------------------------------------------------------
-print("\n[2/12] EMAE y Salarios desde apis.datos.gob.ar...")
+print("\n[2/10] EMAE y RIPTE...")
 
+# EMAE desde API datos.gob.ar
 EMAE_SERIE_ID = "143.3_NO_PR_2004_A_21"
 df_emae_raw = fetch_indec_series(EMAE_SERIE_ID, "EMAE")
 if not df_emae_raw.empty:
     print(f"  ✓ EMAE: {len(df_emae_raw)} filas, último {df_emae_raw['fecha'].max().date()}")
-else:
-    print(f"  ✗ EMAE: sin datos")
 macro_dfs["emae"] = df_emae_raw
 
-# FIX SALARIO REAL: cascada de fallbacks
-# 1) RIPTE
-# 2) Índice de Salarios (nivel general)
-# 3) Sector Privado Registrado
-SALARIO_CANDIDATES = [
-    ("57.1_RIPTE_0_M_8", "RIPTE"),
-    ("152.1_INDICE_SIRS_0_M_18", "Indice Salarios"),
-    ("151.3_INDICE_SPSRS_0_M_15", "Salario Privado"),
-]
+# RIPTE desde CSV directo (URL verificada)
+RIPTE_CSV_URL = "https://infra.datos.gob.ar/catalog/sspm/dataset/158/distribution/158.1/download/remuneracion-imponible-promedio-trabajadores-estables-ripte-total-pais-pesos-serie-mensual.csv"
+df_ripte_raw = pd.DataFrame()
+try:
+    df_raw = fetch_csv(RIPTE_CSV_URL)
+    if not df_raw.empty and "indice_tiempo" in df_raw.columns and "ripte" in df_raw.columns:
+        df_ripte_raw = df_raw.rename(columns={"indice_tiempo": "fecha", "ripte": "RIPTE"})
+        df_ripte_raw["fecha"] = pd.to_datetime(df_ripte_raw["fecha"], errors="coerce")
+        df_ripte_raw["RIPTE"] = pd.to_numeric(df_ripte_raw["RIPTE"], errors="coerce")
+        df_ripte_raw = df_ripte_raw.dropna().sort_values("fecha").reset_index(drop=True)
+        print(f"  ✓ RIPTE: {len(df_ripte_raw)} filas, último {df_ripte_raw['fecha'].max().date()}, "
+              f"valor {df_ripte_raw['RIPTE'].iloc[-1]}")
+except Exception as e:
+    print(f"  ✗ RIPTE: {e}")
 
-df_salario_raw = pd.DataFrame()
-salario_fuente_usada = None
-for serie_id, nombre in SALARIO_CANDIDATES:
-    df_test = fetch_indec_series(serie_id, "Salario")
-    if not df_test.empty:
-        last_date = df_test["fecha"].max()
-        age = (pd.Timestamp.now() - last_date).days
-        print(f"  • {nombre} ({serie_id}): último {last_date.date()}, lag {age}d")
-        if df_salario_raw.empty or age < (pd.Timestamp.now() - df_salario_raw["fecha"].max()).days:
-            df_salario_raw = df_test
-            salario_fuente_usada = nombre
-
-if not df_salario_raw.empty:
-    print(f"  ✓ Serie de salarios elegida: {salario_fuente_usada}")
-else:
-    print(f"  ✗ Ninguna serie de salarios disponible")
-macro_dfs["salario"] = df_salario_raw
+macro_dfs["ripte"] = df_ripte_raw
 
 
 # ---------------------------------------------------------------
 # 3. IPC
 # ---------------------------------------------------------------
-print("\n[3/12] IPC derivados...")
+print("\n[3/10] IPC derivados...")
 
 
 def ipc_serie_12m(df_ipc):
@@ -253,14 +249,13 @@ ipc_yoy = ipc_interanual(df_ipc, 12) if not df_ipc.empty else None
 ipc_accel = ipc_aceleracion_pp(df_ipc) if not df_ipc.empty else None
 ipc_fechas_12m, ipc_valores_12m = ipc_serie_12m(df_ipc) if not df_ipc.empty else ([], [])
 
-accel_str = f"{ipc_accel:+.2f}pp" if ipc_accel is not None else "N/D"
-print(f"  ✓ IPC: {ipc_mes}% | YoY: {ipc_yoy}% | Acel: {accel_str}")
+print(f"  ✓ IPC: {ipc_mes}% | YoY: {ipc_yoy}% | Acel: {ipc_accel}pp")
 
 
 # ---------------------------------------------------------------
-# 4. EMAE
+# 4. EMAE derivados
 # ---------------------------------------------------------------
-print("\n[4/12] EMAE...")
+print("\n[4/10] EMAE...")
 
 
 def serie_12m(df, col):
@@ -281,7 +276,6 @@ if not df_emae_raw.empty:
     emae_val = float(df_emae_raw["EMAE"].iloc[-1])
     last_date = df_emae_raw["fecha"].iloc[-1]
     emae_age_days = (pd.Timestamp.now() - last_date).days
-    # YoY exacto: 12 meses atrás del último dato
     target = last_date - pd.DateOffset(months=12)
     ant = df_emae_raw[df_emae_raw["fecha"] <= target]
     if not ant.empty:
@@ -293,17 +287,17 @@ print(f"  ✓ EMAE: val={emae_val} | YoY={emae_yoy}% | age={emae_age_days}d")
 
 
 # ---------------------------------------------------------------
-# 5. SALARIO REAL
+# 5. SALARIO REAL (RIPTE / IPC)
 # ---------------------------------------------------------------
-print("\n[5/12] Salario real (deflactado por IPC)...")
+print("\n[5/10] Salario real...")
 
 salario_real_yoy = None
 salario_real_fechas = []
 salario_real_valores = []
 salario_real_age_days = None
 
-if not df_salario_raw.empty and not df_ipc.empty:
-    df_s = df_salario_raw.copy()
+if not df_ripte_raw.empty and not df_ipc.empty:
+    df_s = df_ripte_raw.copy()
     df_s["ym"] = df_s["fecha"].dt.to_period("M")
     df_s = df_s.drop_duplicates(subset=["ym"], keep="last")
 
@@ -312,66 +306,115 @@ if not df_salario_raw.empty and not df_ipc.empty:
     df_i = df_i.drop_duplicates(subset=["ym"], keep="last")
 
     merged = df_s.merge(df_i[["ym", "IPC"]], on="ym", how="inner").sort_values("ym")
-    print(f"  • Merge salarios+IPC: {len(merged)} filas (necesitamos >=13)")
+    print(f"  • Merge salarios+IPC: {len(merged)} filas")
 
     if len(merged) >= 13:
         slice_ = merged.tail(13).reset_index(drop=True)
-        base_salario = slice_.iloc[0]["Salario"]
+        base_salario = slice_.iloc[0]["RIPTE"]
         factor_ipc = 1.0
         for i in range(1, len(slice_)):
             factor_ipc *= (1 + slice_.iloc[i]["IPC"] / 100)
-            salario_nominal_idx = slice_.iloc[i]["Salario"] / base_salario
+            salario_nominal_idx = slice_.iloc[i]["RIPTE"] / base_salario
             salario_real = salario_nominal_idx / factor_ipc * 100
             salario_real_valores.append(round(salario_real, 2))
             salario_real_fechas.append(slice_.iloc[i]["ym"].strftime("%b %y"))
 
         if salario_real_valores:
             salario_real_yoy = round(salario_real_valores[-1] - 100, 2)
-        salario_real_age_days = (pd.Timestamp.now() - df_salario_raw["fecha"].iloc[-1]).days
+        salario_real_age_days = (pd.Timestamp.now() - df_ripte_raw["fecha"].iloc[-1]).days
 
-print(f"  ✓ Salario real: YoY={salario_real_yoy}% | age={salario_real_age_days}d | fuente={salario_fuente_usada}")
+print(f"  ✓ Salario real: YoY={salario_real_yoy}% | age={salario_real_age_days}d")
 
 
 # ---------------------------------------------------------------
-# 6. BCRA TASAS
+# 6. BCRA v4.0 - TASAS + RESERVAS
 # ---------------------------------------------------------------
-print("\n[6/12] Tasas BCRA...")
+print("\n[6/10] BCRA API v4.0...")
+
+BCRA_V4_BASE = "https://api.bcra.gob.ar/estadisticas/v4.0/Monetarias"
 
 
-def fetch_bcra_principal(var_id, desde=None, hasta=None):
-    url = f"https://api.bcra.gob.ar/estadisticas/v3.0/monetarias/{var_id}"
-    params = {}
+def fetch_bcra_v4(var_id, desde=None, hasta=None):
+    """API BCRA v4.0 Monetarias."""
+    url = f"{BCRA_V4_BASE}/{var_id}"
+    params = {"limit": 3000}
     if desde:
         params["desde"] = desde
     if hasta:
         params["hasta"] = hasta
     try:
-        r = requests.get(url, headers=HEADERS, params=params, timeout=20, verify=False)
+        r = requests.get(url, headers=HEADERS, params=params, timeout=30, verify=False)
         if r.status_code == 200:
             d = r.json()
             return d.get("results", [])
-        print(f"  ⚠ BCRA var {var_id}: HTTP {r.status_code}")
+        print(f"  ⚠ BCRA v4 var {var_id}: HTTP {r.status_code}")
         return []
     except Exception as e:
-        print(f"  ⚠ BCRA var {var_id}: {e}")
+        print(f"  ⚠ BCRA v4 var {var_id}: {e}")
         return []
 
 
 def get_tasa_actual(var_id):
-    res = fetch_bcra_principal(var_id)
+    res = fetch_bcra_v4(var_id, desde=(HOY - timedelta(days=30)).strftime("%Y-%m-%d"))
     if not res:
         return None
     try:
+        # La API ahora devuelve results ordenados, tomamos el último
         return float(res[-1]["valor"])
     except Exception:
         return None
 
 
+def get_serie_bcra(var_id, dias=400):
+    """Devuelve DataFrame con fecha y valor."""
+    res = fetch_bcra_v4(var_id, desde=(HOY - timedelta(days=dias)).strftime("%Y-%m-%d"))
+    if not res:
+        return pd.DataFrame()
+    try:
+        df = pd.DataFrame(res)
+        df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
+        df["valor"] = pd.to_numeric(df["valor"], errors="coerce")
+        df = df.dropna().sort_values("fecha").reset_index(drop=True)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+# IDs BCRA v4.0 (confirmados):
+# 1 = Reservas internacionales (USD millones)
+# 6 = Tipo Cambio Mayorista (Com. A 3500)
+# 7 = BADLAR Bancos Privados (TNA)
+# 8 = TM20 Bancos Privados
+# 34 = Tasa Plazo Fijo 30 días (TNA)
+# 160 = TAMAR Bancos Privados (TNA) - nueva tasa referencia
 tasa_plazo_fijo = get_tasa_actual(34)
 tasa_badlar = get_tasa_actual(7)
 tasa_tm20 = get_tasa_actual(8)
+tasa_tamar = get_tasa_actual(160)
 
-print(f"  ✓ PF: {tasa_plazo_fijo}% | BADLAR: {tasa_badlar}% | TM20: {tasa_tm20}%")
+# Serie de reservas para calcular deltas
+df_reservas = get_serie_bcra(1, dias=400)
+reservas_actual = None
+reservas_1m = None
+reservas_1a = None
+if not df_reservas.empty:
+    reservas_actual = float(df_reservas["valor"].iloc[-1])
+    # 1 mes atrás
+    target_1m = df_reservas["fecha"].iloc[-1] - timedelta(days=30)
+    sub_1m = df_reservas[df_reservas["fecha"] <= target_1m]
+    if not sub_1m.empty:
+        reservas_1m = float(sub_1m["valor"].iloc[-1])
+    # 1 año atrás
+    target_1a = df_reservas["fecha"].iloc[-1] - timedelta(days=365)
+    sub_1a = df_reservas[df_reservas["fecha"] <= target_1a]
+    if not sub_1a.empty:
+        reservas_1a = float(sub_1a["valor"].iloc[-1])
+
+reservas_delta_1m = pct_change(reservas_actual, reservas_1m) if reservas_actual and reservas_1m else None
+reservas_delta_1a = pct_change(reservas_actual, reservas_1a) if reservas_actual and reservas_1a else None
+
+print(f"  ✓ Plazo Fijo: {tasa_plazo_fijo}% | BADLAR: {tasa_badlar}% | TM20: {tasa_tm20}% | TAMAR: {tasa_tamar}%")
+print(f"  ✓ Reservas: USD {reservas_actual}M | 1M: {reservas_delta_1m}% | 1A: {reservas_delta_1a}%")
 
 
 def tna_a_retorno_periodo(tna, meses):
@@ -381,15 +424,11 @@ def tna_a_retorno_periodo(tna, meses):
     return round(((1 + tasa_mensual) ** meses - 1) * 100, 2)
 
 
+# Estimaciones de tasas de financiamiento (basadas en BADLAR + spreads)
 def estimar_tasa_financiamiento():
     if tasa_badlar is None:
-        return {
-            "adelanto_cta_cte": None,
-            "tarjeta_credito": None,
-            "prestamo_personal": None,
-            "hipotecario_uva": None,
-            "sgr_cheque": None,
-        }
+        return {k: None for k in ["adelanto_cta_cte", "tarjeta_credito", "prestamo_personal",
+                                   "hipotecario_uva", "sgr_cheque"]}
     return {
         "adelanto_cta_cte": round(tasa_badlar + 15, 1),
         "tarjeta_credito": round(tasa_badlar + 25, 1),
@@ -404,9 +443,9 @@ print(f"  ✓ Financiamiento: {tasas_fin}")
 
 
 # ---------------------------------------------------------------
-# 7. BENCHMARK VALOR REAL
+# 7. BENCHMARK + VALOR REAL
 # ---------------------------------------------------------------
-print("\n[7/12] Benchmark y valor real...")
+print("\n[7/10] Benchmark USD...")
 
 
 def get_bench(months):
@@ -425,8 +464,7 @@ def get_bench(months):
         usd_ant = float(usd_ant_rows["USD_Oficial"].iloc[-1])
         dev = (usd_hoy / usd_ant) - 1
         return round((((1 + ipc_acc) / (1 + dev)) - 1) * 100, 2)
-    except Exception as e:
-        print(f"  ⚠ get_bench({months}m): {e}")
+    except Exception:
         return None
 
 
@@ -459,7 +497,7 @@ def tasa_a_retorno_real_usd(tna, meses, bench_pct):
 # ---------------------------------------------------------------
 # 8. MERCADOS yfinance
 # ---------------------------------------------------------------
-print("\n[8/12] Mercados yfinance...")
+print("\n[8/10] Mercados yfinance...")
 
 tickers = {
     "SP500": "^GSPC",
@@ -470,8 +508,6 @@ tickers = {
     "AL30": "AL30.BA",
     "GGAL_ADR": "GGAL",
     "GGAL_LOC": "GGAL.BA",
-    "NVDA": "NVDA", "MELI": "MELI", "MSFT": "MSFT", "GOOGL": "GOOGL",
-    "VIST": "VIST", "YPF": "YPF", "PAMP": "PAM", "META": "META",
     "US10Y": "^TNX",
 }
 
@@ -512,60 +548,55 @@ print(f"  ✓ df_final: {len(df_final)} filas")
 
 
 # ---------------------------------------------------------------
-# 9. MACRO GLOBAL (FRED con parser robusto)
+# 9. MACRO GLOBAL (FRED + BCB Brasil + INE Chile)
 # ---------------------------------------------------------------
-print("\n[9/12] Macro global (FRED)...")
-
-FRED_SERIES = {
-    "FEDFUNDS": "FEDFUNDS",
-    "BR_SELIC": "INTDSRBRM193N",
-    "CL_TPM": "IR3TIB01CLM156N",
-    "US_CPI": "CPIAUCSL",
-    "BR_CPI": "BRACPIALLMINMEI",
-    "CL_CPI": "CHLCPIALLMINMEI",
-    "US10Y": "DGS10",
-    "BR10Y": "INTGSBBRM193N",
-}
+print("\n[9/10] Macro global...")
 
 
-def fetch_fred(serie_id):
-    """FRED CSV robusto: detecta columnas por posición (no por nombre)."""
-    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={serie_id}"
+def fetch_fred_api(serie_id):
+    """FRED con API key."""
+    if not FRED_API_KEY:
+        # Fallback: CSV público
+        url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={serie_id}"
+        df = fetch_csv(url)
+        if df.empty:
+            return pd.DataFrame()
+        df.columns = ["fecha"] + list(df.columns[1:])
+        df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
+        val_col = df.columns[1]
+        df[val_col] = df[val_col].replace(".", pd.NA)
+        df[val_col] = pd.to_numeric(df[val_col], errors="coerce")
+        df = df.dropna().sort_values("fecha").reset_index(drop=True)
+        df = df.rename(columns={val_col: "valor"})
+        return df[["fecha", "valor"]]
+
+    url = f"https://api.stlouisfed.org/fred/series/observations"
+    params = {
+        "series_id": serie_id,
+        "api_key": FRED_API_KEY,
+        "file_type": "json",
+        "observation_start": (HOY - timedelta(days=400)).strftime("%Y-%m-%d"),
+    }
     try:
-        r = requests.get(url, headers=HEADERS, timeout=20)
+        r = requests.get(url, params=params, timeout=20)
         if r.status_code != 200:
             print(f"  ⚠ FRED {serie_id}: HTTP {r.status_code}")
             return pd.DataFrame()
-        from io import StringIO
-        df = pd.read_csv(StringIO(r.text))
-        if df.shape[1] < 2 or df.empty:
-            print(f"  ⚠ FRED {serie_id}: estructura inesperada")
+        data = r.json()
+        obs = data.get("observations", [])
+        if not obs:
             return pd.DataFrame()
-        df.columns = ["fecha", "valor"] + list(df.columns[2:])
-        df = df[["fecha", "valor"]]
-        df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
-        # FRED usa "." para marcar missing → convertirlos a NaN
-        df["valor"] = df["valor"].replace(".", pd.NA)
-        df["valor"] = pd.to_numeric(df["valor"], errors="coerce")
-        df = df.dropna().sort_values("fecha").reset_index(drop=True)
-        return df
+        df = pd.DataFrame(obs)
+        df["fecha"] = pd.to_datetime(df["date"], errors="coerce")
+        df["valor"] = pd.to_numeric(df["value"], errors="coerce")
+        df = df.dropna(subset=["fecha", "valor"]).sort_values("fecha").reset_index(drop=True)
+        return df[["fecha", "valor"]]
     except Exception as e:
         print(f"  ⚠ FRED {serie_id}: {e}")
         return pd.DataFrame()
 
 
-fred_dfs = {}
-for name, sid in FRED_SERIES.items():
-    df = fetch_fred(sid)
-    if not df.empty:
-        fred_dfs[name] = df
-        print(f"  ✓ FRED {name}: {len(df)} filas, último {df['fecha'].max().date()}={df['valor'].iloc[-1]}")
-    else:
-        fred_dfs[name] = pd.DataFrame()
-
-
-def ultimo_fred(name):
-    df = fred_dfs.get(name, pd.DataFrame())
+def ultimo_valor(df):
     if df.empty:
         return None
     try:
@@ -574,64 +605,163 @@ def ultimo_fred(name):
         return None
 
 
-def yoy_fred_cpi(name):
-    """YoY para CPIs (índices nivel). Usa 12 puntos atrás, no 13."""
-    df = fred_dfs.get(name, pd.DataFrame())
-    if df.empty or len(df) < 13:
-        return None
+# EEUU: Fed Funds + CPI
+df_fedfunds = fetch_fred_api("FEDFUNDS")
+df_cpi_us = fetch_fred_api("CPIAUCSL")
+tasa_pm_us = ultimo_valor(df_fedfunds)
+# Inflación YoY USA
+inf_us = None
+if not df_cpi_us.empty and len(df_cpi_us) >= 13:
     try:
-        ult = float(df["valor"].iloc[-1])
-        ant = float(df["valor"].iloc[-13])
-        return round(((ult / ant) - 1) * 100, 2)
-    except Exception:
-        return None
-
-
-macro_global = {
-    "argentina": {
-        "tasa_pm": tasa_plazo_fijo,
-        "inflacion_yoy": ipc_yoy,
-        "cds_5y": None,
-        "bono_10y": None,
-    },
-    "brasil": {
-        "tasa_pm": ultimo_fred("BR_SELIC"),
-        "inflacion_yoy": yoy_fred_cpi("BR_CPI"),
-        "cds_5y": None,
-        "bono_10y": ultimo_fred("BR10Y"),
-    },
-    "chile": {
-        "tasa_pm": ultimo_fred("CL_TPM"),
-        "inflacion_yoy": yoy_fred_cpi("CL_CPI"),
-        "cds_5y": None,
-        "bono_10y": None,
-    },
-    "eeuu": {
-        "tasa_pm": ultimo_fred("FEDFUNDS"),
-        "inflacion_yoy": yoy_fred_cpi("US_CPI"),
-        "cds_5y": 25,  # CDS US es bajísimo (~25bps), valor estático razonable
-        "bono_10y": ultimo_fred("US10Y"),
-    },
-}
-
-# CDS Argentina vía riesgo país (proxy)
-if not macro_dfs["rp"].empty:
-    try:
-        rp_last = float(macro_dfs["rp"]["Riesgo_Pais"].iloc[-1])
-        macro_global["argentina"]["cds_5y"] = round(rp_last, 0)
-        # Usamos el riesgo país convertido a yield estimado sobre 10Y
-        # bono_10y aprox: yield AL30 de yfinance es difícil de obtener limpio
-        # dejamos el riesgo país como mejor proxy disponible
-        macro_global["argentina"]["bono_10y"] = None
+        ult = float(df_cpi_us["valor"].iloc[-1])
+        ant = float(df_cpi_us["valor"].iloc[-13])
+        inf_us = round(((ult / ant) - 1) * 100, 2)
     except Exception:
         pass
 
-# CDS Chile y Brasil aproximados (valores públicos típicos 2025-2026)
-# Chile: ~60bps, Brasil: ~200bps
-if macro_global["chile"]["cds_5y"] is None:
-    macro_global["chile"]["cds_5y"] = 60
-if macro_global["brasil"]["cds_5y"] is None:
-    macro_global["brasil"]["cds_5y"] = 200
+print(f"  ✓ EEUU: Fed={tasa_pm_us}% | Inflación YoY={inf_us}%")
+
+
+# Brasil: api.bcb.gov.br
+def fetch_bcb_brasil(serie_id, ultimos=15):
+    url = f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{serie_id}/dados/ultimos/{ultimos}?formato=json"
+    data = fetch_json(url)
+    if not data:
+        return pd.DataFrame()
+    try:
+        df = pd.DataFrame(data)
+        df["fecha"] = pd.to_datetime(df["data"], format="%d/%m/%Y", errors="coerce")
+        df["valor"] = pd.to_numeric(df["valor"], errors="coerce")
+        return df[["fecha", "valor"]].dropna().sort_values("fecha").reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame()
+
+
+# BCB 433 = IPCA (var % mensual), 432 = Selic meta (% anual)
+df_ipca_br = fetch_bcb_brasil(433, ultimos=15)
+df_selic_br = fetch_bcb_brasil(432, ultimos=5)
+
+tasa_pm_br = ultimo_valor(df_selic_br)
+# Inflación YoY Brasil: acumular 12 últimos meses
+inf_br = None
+if not df_ipca_br.empty and len(df_ipca_br) >= 12:
+    try:
+        ultimos_12 = df_ipca_br.tail(12)["valor"].astype(float) / 100
+        inf_br = round(((1 + ultimos_12).prod() - 1) * 100, 2)
+    except Exception:
+        pass
+
+print(f"  ✓ Brasil: Selic={tasa_pm_br}% | Inflación YoY={inf_br}%")
+
+
+# Chile: INE con credenciales
+def fetch_chile_ipc():
+    """
+    INE Chile tiene su API de estadísticas:
+    https://stat.ine.cl/SDMX-JSON/data/IPC_CATEG_ORIG_POND/all/all?format=csv
+    
+    También hay una API con usuario/pass en el servicio de búsqueda.
+    Usamos el endpoint público de estadísticas mensuales.
+    """
+    # Intento 1: API pública con credenciales
+    if CHILE_USER and CHILE_PASS:
+        url = "https://api.cmfchile.cl/api-sbifv3/recursos_api/ipc"
+        params = {
+            "apikey": CHILE_PASS,  # la clave suele ser el pass en API banco central
+            "formato": "json",
+        }
+        data = fetch_json(url, headers={"user": CHILE_USER})
+        if data and "IPCs" in data:
+            try:
+                rows = data["IPCs"]
+                df = pd.DataFrame(rows)
+                df["fecha"] = pd.to_datetime(df.get("Fecha", df.get("fecha")), errors="coerce")
+                df["valor"] = pd.to_numeric(df.get("Valor", df.get("valor")).astype(str).str.replace(",", "."), errors="coerce")
+                return df[["fecha", "valor"]].dropna().sort_values("fecha").reset_index(drop=True)
+            except Exception as e:
+                print(f"  ⚠ Parse Chile IPC: {e}")
+
+    # Fallback: FRED Chile CPI
+    df = fetch_fred_api("CHLCPIALLMINMEI")
+    return df
+
+
+df_ipc_cl = fetch_chile_ipc()
+inf_cl = None
+if not df_ipc_cl.empty and len(df_ipc_cl) >= 13:
+    try:
+        ult = float(df_ipc_cl["valor"].iloc[-1])
+        ant = float(df_ipc_cl["valor"].iloc[-13])
+        inf_cl = round(((ult / ant) - 1) * 100, 2)
+    except Exception:
+        pass
+
+# Tasa política monetaria Chile: Banco Central Chile
+# TPM actual via FRED IR3TIB01CLM156N
+df_tpm_cl = fetch_fred_api("IR3TIB01CLM156N")
+tasa_pm_cl = ultimo_valor(df_tpm_cl)
+
+print(f"  ✓ Chile: TPM={tasa_pm_cl}% | Inflación YoY={inf_cl}%")
+
+
+# Riesgo País Argentina
+rp_arg = None
+if not macro_dfs["rp"].empty:
+    try:
+        rp_arg = int(float(macro_dfs["rp"]["Riesgo_Pais"].iloc[-1]))
+    except Exception:
+        pass
+
+
+# Tasa real = Tasa nominal - inflación
+def tasa_real(tasa_nom, inf_yoy):
+    if tasa_nom is None or inf_yoy is None:
+        return None
+    try:
+        # Fórmula de Fisher: (1+nom)/(1+inf) - 1
+        return round(((1 + tasa_nom / 100) / (1 + inf_yoy / 100) - 1) * 100, 2)
+    except Exception:
+        return None
+
+
+# Para Argentina uso Plazo Fijo 30d como tasa nominal (lo que el ahorrista puede conseguir)
+tasa_real_arg = tasa_real(tasa_plazo_fijo, ipc_yoy)
+tasa_real_br = tasa_real(tasa_pm_br, inf_br)
+tasa_real_cl = tasa_real(tasa_pm_cl, inf_cl)
+tasa_real_us = tasa_real(tasa_pm_us, inf_us)
+
+# Riesgo soberano estimado: Chile y Brasil con valores públicos típicos recientes
+# En producción se podría conectar con bonos corporativos/sovereign CDS
+cds_br = 200  # aprox
+cds_cl = 65
+cds_us = 30
+
+macro_global = {
+    "argentina": {
+        "inflacion_yoy": ipc_yoy,
+        "tasa_nominal": tasa_plazo_fijo,
+        "tasa_real": tasa_real_arg,
+        "riesgo_pais": rp_arg,
+    },
+    "brasil": {
+        "inflacion_yoy": inf_br,
+        "tasa_nominal": tasa_pm_br,
+        "tasa_real": tasa_real_br,
+        "riesgo_pais": cds_br,
+    },
+    "chile": {
+        "inflacion_yoy": inf_cl,
+        "tasa_nominal": tasa_pm_cl,
+        "tasa_real": tasa_real_cl,
+        "riesgo_pais": cds_cl,
+    },
+    "eeuu": {
+        "inflacion_yoy": inf_us,
+        "tasa_nominal": tasa_pm_us,
+        "tasa_real": tasa_real_us,
+        "riesgo_pais": cds_us,
+    },
+}
 
 print(f"  ✓ Macro global:")
 for pais, d in macro_global.items():
@@ -641,131 +771,179 @@ for pais, d in macro_global.items():
 # ---------------------------------------------------------------
 # 10. ROFEX + REM
 # ---------------------------------------------------------------
-print("\n[10/12] Futuros ROFEX + REM...")
+print("\n[10/10] ROFEX + REM + noticias...")
 
 
-def fetch_rofex_futuros():
-    url = "https://apicem.matbarofex.com.ar/api/v2/closing-prices"
-    desde = (HOY - timedelta(days=7)).strftime("%Y-%m-%d")
-    params = {"from": desde, "market": "ROFX", "product": "DLR", "version": "v2"}
+def fetch_rofex_con_pyrofex():
+    """
+    Usa pyRofex con credenciales de ReMarkets.
+    Requiere secrets ROFEX_USER y ROFEX_PASS.
+    """
+    if not ROFEX_USER or not ROFEX_PASS:
+        print(f"  • ROFEX: sin credenciales, salto")
+        return []
+
     try:
-        r = requests.get(url, params=params, headers=HEADERS, timeout=20)
-        if r.status_code == 200:
-            data = r.json()
-            rows = data.get("data", []) if isinstance(data, dict) else data
-            if not rows:
-                return []
-            df = pd.DataFrame(rows)
-            if "dateTime" in df.columns:
-                df["dateTime"] = pd.to_datetime(df["dateTime"], errors="coerce")
-                last_date = df["dateTime"].max()
-                df = df[df["dateTime"] == last_date]
-            out = []
-            for _, row in df.iterrows():
-                try:
-                    symbol = row.get("symbol", "")
-                    precio = row.get("settlementPrice") or row.get("adjustmentPrice") or row.get("closingPrice")
-                    if precio and "DLR" in str(symbol):
-                        out.append({
-                            "vencimiento": symbol.replace("DLR/", ""),
-                            "precio": float(precio),
-                        })
-                except Exception:
+        import pyRofex
+
+        pyRofex.initialize(
+            user=ROFEX_USER,
+            password=ROFEX_PASS,
+            account="",
+            environment=pyRofex.Environment.LIVE,
+        )
+
+        # Obtener instrumentos
+        instruments = pyRofex.get_all_instruments()
+        if not instruments or "instruments" not in instruments:
+            print(f"  ⚠ ROFEX: sin instrumentos")
+            return []
+
+        futuros = []
+        for ins in instruments["instruments"]:
+            try:
+                instrument_id = ins.get("instrumentId", {})
+                symbol = instrument_id.get("symbol", "")
+                # Solo futuros de dólar (símbolos DLR/)
+                if not symbol.startswith("DLR/"):
                     continue
-            return out
-        print(f"  ⚠ ROFEX: HTTP {r.status_code}")
+                md = pyRofex.get_market_data(
+                    ticker=symbol,
+                    entries=[pyRofex.MarketDataEntry.SETTLEMENT_PRICE,
+                             pyRofex.MarketDataEntry.CLOSING_PRICE],
+                )
+                if md.get("status") == "OK":
+                    data = md.get("marketData", {})
+                    precio = None
+                    if "SE" in data and data["SE"].get("price"):
+                        precio = data["SE"]["price"]
+                    elif "CL" in data and data["CL"].get("price"):
+                        precio = data["CL"]["price"]
+                    if precio:
+                        venc = symbol.replace("DLR/", "")
+                        futuros.append({"vencimiento": venc, "precio": float(precio)})
+            except Exception:
+                continue
+
+        print(f"  ✓ ROFEX: {len(futuros)} contratos")
+        return sorted(futuros, key=lambda x: x["vencimiento"])
+    except ImportError:
+        print(f"  ⚠ pyRofex no instalado, agregalo a requirements.txt")
         return []
     except Exception as e:
         print(f"  ⚠ ROFEX: {e}")
         return []
 
 
-rofex_futuros = fetch_rofex_futuros()
-
-if not rofex_futuros:
-    print(f"  ⚠ ROFEX vacío → proyección simple")
-    try:
-        usd_hoy = float(macro_dfs["oficial"]["USD_Oficial"].iloc[-1])
-        rofex_futuros = [
-            {"vencimiento": "+1M", "precio": round(usd_hoy * 1.02, 2)},
-            {"vencimiento": "+3M", "precio": round(usd_hoy * 1.06, 2)},
-            {"vencimiento": "+6M", "precio": round(usd_hoy * 1.12, 2)},
-            {"vencimiento": "+12M", "precio": round(usd_hoy * 1.25, 2)},
-        ]
-    except Exception:
-        rofex_futuros = []
-
-print(f"  ✓ ROFEX: {len(rofex_futuros)} contratos")
+rofex_futuros = fetch_rofex_con_pyrofex()
 
 
-# === MÉTRICAS DÓLAR FUTURO (lo que pediste) ===
-ratio_dolar_12m_spot = None
-dev_anualizada_implicita = None
-try:
-    if rofex_futuros and not macro_dfs["oficial"].empty:
-        usd_spot = float(macro_dfs["oficial"]["USD_Oficial"].iloc[-1])
-        # Buscar el contrato a 12 meses (o el más largo disponible)
-        fut_largo = None
-        for f in rofex_futuros:
-            if "12M" in str(f.get("vencimiento", "")) or "+12" in str(f.get("vencimiento", "")):
-                fut_largo = f
-                break
-        if fut_largo is None and rofex_futuros:
-            fut_largo = rofex_futuros[-1]  # el más lejano
-        if fut_largo:
-            precio_12m = float(fut_largo["precio"])
-            ratio_dolar_12m_spot = round(precio_12m / usd_spot, 3)  # ej 1.25
-            dev_anualizada_implicita = round((precio_12m / usd_spot - 1) * 100, 2)  # ej +25%
-except Exception as e:
-    print(f"  ⚠ Cálculo ratio futuro: {e}")
-
-print(f"  ✓ Ratio futuro 12m/spot: {ratio_dolar_12m_spot}x | Devaluación implícita: {dev_anualizada_implicita}%")
-
-
-def fetch_rem_bcra():
-    series_rem = {
-        "inflacion_12m": "11.1_REM_EX_INF_0_M_10",
-        "pbi_2025": "11.2_REM_EX_PBI_0_A_11",
-        "tc_diciembre": "11.3_REM_EX_TCN_M_27",
+# REM via API de Facundo Allia (verificada)
+def fetch_rem_api():
+    """API pública con REM parseado. Endpoints: ipc_general, tipo_cambio, tasa_interes, pbi."""
+    base = "https://bcra-rem-api.facujallia.workers.dev/api"
+    out = {
+        "inflacion_mensual_proxima": None,
+        "inflacion_12m": None,
+        "tc_12m": None,
+        "tasa_12m": None,
+        "pbi_trim": None,
     }
-    out = {}
-    for key, sid in series_rem.items():
-        df = fetch_indec_series(sid, key)
-        if not df.empty:
-            try:
-                out[key] = float(df[key].iloc[-1])
-            except Exception:
-                pass
+
+    # Inflación
+    data = fetch_json(f"{base}/ipc_general")
+    if data and "datos" in data:
+        for row in data["datos"]:
+            ref = str(row.get("referencia", "")).lower()
+            if "próx. 12 meses" in ref or "prox. 12 meses" in ref:
+                out["inflacion_12m"] = row.get("mediana")
+            # Primera proyección mensual (mes siguiente)
+            if "mensual" in ref and out["inflacion_mensual_proxima"] is None:
+                out["inflacion_mensual_proxima"] = row.get("mediana")
+
+    # Tipo de cambio
+    time.sleep(1)  # evitar rate limit
+    data = fetch_json(f"{base}/tipo_cambio")
+    if data and "datos" in data:
+        for row in data["datos"]:
+            ref = str(row.get("referencia", "")).lower()
+            if "próx. 12 meses" in ref or "prox. 12 meses" in ref:
+                out["tc_12m"] = row.get("mediana")
+
+    # Tasa
+    time.sleep(1)
+    data = fetch_json(f"{base}/tasa_interes")
+    if data and "datos" in data:
+        for row in data["datos"]:
+            ref = str(row.get("referencia", "")).lower()
+            if "próx. 12 meses" in ref or "prox. 12 meses" in ref:
+                out["tasa_12m"] = row.get("mediana")
+
+    # PBI
+    time.sleep(1)
+    data = fetch_json(f"{base}/pbi")
+    if data and "datos" in data:
+        datos = data["datos"]
+        if datos:
+            # Tomar primer dato disponible
+            out["pbi_trim"] = datos[0].get("mediana")
+
     return out
 
 
-rem = fetch_rem_bcra()
-if not rem:
-    rem = {"inflacion_12m": None, "pbi_2025": None, "tc_diciembre": None}
+rem = fetch_rem_api()
 print(f"  ✓ REM: {rem}")
 
 
-inflacion_implicita_12m = None
+# Ratio dólar futuro / spot
+ratio_dolar_12m_spot = None
+dev_anualizada_implicita = None
 try:
-    if ipc_yoy is not None:
-        inflacion_implicita_12m = round((ipc_yoy + (rem.get("inflacion_12m") or ipc_yoy)) / 2, 1)
-except Exception:
-    pass
+    usd_spot = float(macro_dfs["oficial"]["USD_Oficial"].iloc[-1]) if not macro_dfs["oficial"].empty else None
+
+    # Prioridad 1: ROFEX largo
+    precio_12m = None
+    if rofex_futuros and usd_spot:
+        # Buscar contrato a ~12 meses
+        for f in rofex_futuros[::-1]:
+            venc_str = str(f.get("vencimiento", ""))
+            if any(m in venc_str.upper() for m in ["DIC", "ENE", "NOV"]):
+                precio_12m = float(f["precio"])
+                break
+        if precio_12m is None and rofex_futuros:
+            precio_12m = float(rofex_futuros[-1]["precio"])
+
+    # Prioridad 2: REM tipo de cambio
+    if precio_12m is None and rem.get("tc_12m"):
+        precio_12m = float(rem["tc_12m"])
+
+    if precio_12m and usd_spot:
+        ratio_dolar_12m_spot = round(precio_12m / usd_spot, 3)
+        dev_anualizada_implicita = round((precio_12m / usd_spot - 1) * 100, 2)
+except Exception as e:
+    print(f"  ⚠ Ratio futuro: {e}")
+
+print(f"  ✓ Ratio 12m/spot: {ratio_dolar_12m_spot}x | Dev implícita: {dev_anualizada_implicita}%")
 
 
+# Inflación implícita 12m: usar REM si hay, si no fallback
+inflacion_implicita_12m = rem.get("inflacion_12m") or ipc_yoy
+
+# Tasa real esperada = plazo fijo nominal vs inflación esperada
 tasa_real_esperada = None
 if tasa_plazo_fijo and inflacion_implicita_12m:
     try:
-        tasa_real_esperada = round(((1 + tasa_plazo_fijo / 100) / (1 + inflacion_implicita_12m / 100) - 1) * 100, 2)
+        tasa_real_esperada = round(((1 + tasa_plazo_fijo / 100) / (1 + float(inflacion_implicita_12m) / 100) - 1) * 100, 2)
     except Exception:
         pass
 
 
-def fetch_vencimientos_soberanos():
-    hoy = HOY
+# Vencimientos deuda (estimación basada en cronograma público AL/GD)
+def vencimientos_deuda_publica():
     vencimientos = []
-    for i in range(1, 25):
-        mes = (hoy.replace(day=1) + timedelta(days=32 * i)).replace(day=1)
+    for i in range(1, 13):
+        mes = (HOY.replace(day=1) + timedelta(days=32 * i)).replace(day=1)
+        # Cronograma típico AL/GD: cupones en enero y julio son los grandes
         if mes.month == 7:
             monto = 4500
         elif mes.month == 1:
@@ -773,7 +951,7 @@ def fetch_vencimientos_soberanos():
         elif mes.month in [3, 9]:
             monto = 1200
         else:
-            monto = 800
+            monto = 600
         vencimientos.append({
             "mes": mes.strftime("%b %y"),
             "monto_usd_mm": monto,
@@ -781,130 +959,13 @@ def fetch_vencimientos_soberanos():
     return vencimientos
 
 
-vencimientos_deuda = fetch_vencimientos_soberanos()
-print(f"  ✓ Vencimientos: {len(vencimientos_deuda)} meses")
+vencimientos_deuda = vencimientos_deuda_publica()
 
 
 # ---------------------------------------------------------------
-# 11. INMOBILIARIO
+# NOTICIAS (scoring estricto)
 # ---------------------------------------------------------------
-print("\n[11/12] Inmobiliario...")
-
-
-def m2_caba_actual():
-    """
-    Valores aproximados actuales CABA (USD/m²).
-    En producción reemplazar con scraping de Reporte Inmobiliario.
-    """
-    return {
-        "venta_m2_usd": 2400,
-        "venta_m2_usd_1a": 2280,  # hace 12m
-        "construccion_m2_usd": 1300,
-        "construccion_m2_usd_1a": 1150,
-    }
-
-
-m2_actual = m2_caba_actual()
-
-# Cálculo variación interanual
-def safe_pct(new, old):
-    try:
-        if not old or old == 0:
-            return None
-        return round(((new / old) - 1) * 100, 1)
-    except Exception:
-        return None
-
-
-m2_venta_yoy = safe_pct(m2_actual["venta_m2_usd"], m2_actual["venta_m2_usd_1a"])
-m2_const_yoy = safe_pct(m2_actual["construccion_m2_usd"], m2_actual["construccion_m2_usd_1a"])
-
-# Años de recupero (ratio precio / alquiler anual)
-alquiler_mensual_m2_usd = m2_actual["venta_m2_usd"] * 0.0035
-años_recupero = round(m2_actual["venta_m2_usd"] / (alquiler_mensual_m2_usd * 12), 1)
-# Años de recupero hace 1 año
-alquiler_1a = m2_actual["venta_m2_usd_1a"] * 0.0040  # ratio histórico un poco más alto
-años_recupero_1a = round(m2_actual["venta_m2_usd_1a"] / (alquiler_1a * 12), 1)
-años_recupero_yoy = safe_pct(años_recupero, años_recupero_1a)
-
-
-def escrituras_datos(ciudad="caba"):
-    """
-    Escrituras actuales, hace 6 meses, hace 12 meses.
-    Valores aproximados basados en Colegio de Escribanos.
-    """
-    if ciudad == "caba":
-        return {"actual": 4500, "hace_6m": 4100, "hace_12m": 3900}
-    else:
-        return {"actual": 2200, "hace_6m": 2000, "hace_12m": 1950}
-
-
-escrit_caba = escrituras_datos("caba")
-escrit_cba = escrituras_datos("cordoba")
-escrit_caba["yoy_pct"] = safe_pct(escrit_caba["actual"], escrit_caba["hace_12m"])
-escrit_caba["s6m_pct"] = safe_pct(escrit_caba["actual"], escrit_caba["hace_6m"])
-escrit_cba["yoy_pct"] = safe_pct(escrit_cba["actual"], escrit_cba["hace_12m"])
-escrit_cba["s6m_pct"] = safe_pct(escrit_cba["actual"], escrit_cba["hace_6m"])
-
-
-def costos_construccion():
-    usd_oficial = 1000
-    try:
-        if not macro_dfs["oficial"].empty:
-            usd_oficial = float(macro_dfs["oficial"]["USD_Oficial"].iloc[-1])
-    except Exception:
-        pass
-    return {
-        "cemento_bolsa_50kg": {
-            "actual_usd": round(8000 / usd_oficial, 2),
-            "hace_1m_usd": round(7500 / usd_oficial * 1.02, 2),
-            "hace_1a_usd": round(7000 / usd_oficial * 0.75, 2),
-        },
-        "acero_tonelada": {
-            "actual_usd": round(1400000 / usd_oficial, 0),
-            "hace_1m_usd": round(1350000 / usd_oficial * 1.02, 0),
-            "hace_1a_usd": round(1200000 / usd_oficial * 0.8, 0),
-        },
-        "mano_obra_jornal": {
-            "actual_usd": round(35000 / usd_oficial, 2),
-            "hace_1m_usd": round(34000 / usd_oficial * 1.02, 2),
-            "hace_1a_usd": round(28000 / usd_oficial * 0.8, 2),
-        },
-    }
-
-
-costos_const = costos_construccion()
-
-
-def creditos_hipotecarios_otorgados():
-    """
-    Serie de MONTOS OTORGADOS mensuales (no stock) en ARS MM.
-    En producción: BCRA publica esto en PublicacionesEstadisticas.
-    Valores aproximados observados.
-    """
-    # Últimos 12 meses, con tendencia creciente desde 2024
-    base = 30000  # ARS MM
-    fechas, valores_otorgados, valores_ipc = [], [], []
-    for i in range(12):
-        mes_dt = HOY - pd.DateOffset(months=(11 - i))
-        mes = mes_dt.strftime("%b %y")
-        # Crecimiento fuerte desde marzo 2024 por apertura del crédito UVA
-        val = round(base * (1 + i * 0.12), 0)
-        ipc_m = ipc_valores_12m[i] if i < len(ipc_valores_12m) else 0
-        fechas.append(mes)
-        valores_otorgados.append(val)
-        valores_ipc.append(ipc_m)
-    return {"fechas": fechas, "otorgados_mm": valores_otorgados, "ipc_mensual": valores_ipc}
-
-
-creditos_hipot = creditos_hipotecarios_otorgados()
-print(f"  ✓ Inmobiliario armado (CABA venta USD {m2_actual['venta_m2_usd']}, YoY {m2_venta_yoy}%)")
-
-
-# ---------------------------------------------------------------
-# 12. NOTICIAS (scoring más estricto)
-# ---------------------------------------------------------------
-print("\n[12/12] Noticias + Gemini...")
+print("\n[Noticias] RSS + scoring...")
 
 RSS_SOURCES = {
     "Ámbito": "https://www.ambito.com/rss/pages/economia.xml",
@@ -916,11 +977,6 @@ RSS_SOURCES = {
     "Perfil": "https://www.perfil.com/feed/economia",
 }
 
-# SCORING MÁS ESTRICTO
-# Regla: para ser "destacada" tiene que cumplir AL MENOS UNA:
-#   - 2+ keywords de capa ALTA
-#   - 1 combo boost
-#   - 1 ALTA + 2 MEDIA
 KEYWORDS_ALTA = [
     "caputo", "milei", "fed", "powell", "bcra", "tipo de cambio",
     "politica monetaria", "política monetaria", "tasa de interes", "tasa de interés",
@@ -937,20 +993,13 @@ KEYWORDS_LEVE = [
     "s&p", "nasdaq", "china", "petroleo", "petróleo", "brent", "oro",
     "bitcoin", "brasil", "selic", "yuan", "euro", "dolar", "dólar",
 ]
-
 COMBOS_BOOST = [
-    (["caputo", "tasa"], 6),
-    (["fed", "tasa"], 6),
-    (["caputo", "dolar"], 5),
-    (["caputo", "dólar"], 5),
-    (["bcra", "tasa"], 5),
-    (["fmi", "reservas"], 5),
-    (["riesgo pais", "bonos"], 4),
-    (["riesgo país", "bonos"], 4),
-    (["inflacion", "politica monetaria"], 4),
-    (["inflación", "política monetaria"], 4),
-    (["milei", "economia"], 3),
-    (["milei", "economía"], 3),
+    (["caputo", "tasa"], 6), (["fed", "tasa"], 6),
+    (["caputo", "dolar"], 5), (["caputo", "dólar"], 5),
+    (["bcra", "tasa"], 5), (["fmi", "reservas"], 5),
+    (["riesgo pais", "bonos"], 4), (["riesgo país", "bonos"], 4),
+    (["inflacion", "politica monetaria"], 4), (["inflación", "política monetaria"], 4),
+    (["milei", "economia"], 3), (["milei", "economía"], 3),
 ]
 
 
@@ -971,9 +1020,6 @@ def parse_date_safe(entry):
 
 
 def score_noticia(titulo, resumen, fecha_pub):
-    """
-    Scoring estricto. Solo las realmente relevantes suben alto.
-    """
     texto = (titulo + " " + resumen).lower()
     score = 0
     count_alta = sum(1 for kw in KEYWORDS_ALTA if kw in texto)
@@ -982,28 +1028,23 @@ def score_noticia(titulo, resumen, fecha_pub):
 
     score += count_alta * 4
     score += count_media * 2
-    score += count_leve * 0.5  # leve ya no aporta tanto
+    score += count_leve * 0.5
 
-    # Combos
     for combo, bonus in COMBOS_BOOST:
         if all(kw in texto for kw in combo):
             score += bonus
 
-    # PENALIZACIÓN: título muy corto o muy genérico
     if len(titulo) < 40:
         score *= 0.7
 
-    # PENALIZACIÓN: menciones solo cotizaciones sin contexto (ej "el dólar cotizó a X")
     patterns_cotizacion = ["cotizó a", "cotizo a", "abrió a", "abrio a", "cerró a", "cerro a"]
     if any(p in texto for p in patterns_cotizacion) and count_alta == 0:
         score *= 0.5
 
-    # FILTRO DURO: si no tiene ningún alta ni combo, penalizo fuerte
     has_combo = any(all(kw in texto for kw in combo) for combo, _ in COMBOS_BOOST)
     if count_alta == 0 and not has_combo:
         score *= 0.6
 
-    # Decaimiento temporal
     horas = max(0, (datetime.now() - fecha_pub).total_seconds() / 3600)
     score *= max(0.3, 1 - horas / 48)
 
@@ -1016,7 +1057,6 @@ for medio, url in RSS_SOURCES.items():
         feed = feedparser.parse(url)
         entries = feed.entries[:15]
         if not entries:
-            print(f"  ✗ {medio}: sin entradas")
             continue
         for e in entries:
             fecha = parse_date_safe(e)
@@ -1034,7 +1074,7 @@ for medio, url in RSS_SOURCES.items():
                 "fecha": fecha.isoformat(),
                 "score": score_noticia(titulo, resumen, fecha),
             })
-        print(f"  ✓ {medio}: {len(entries)} entradas")
+        print(f"  ✓ {medio}: {len(entries)}")
     except Exception as ex:
         print(f"  ✗ {medio}: {ex}")
 
@@ -1058,12 +1098,10 @@ def seleccionar_destacadas(noticias_ord, n=4):
 top_noticias_llm = seleccionar_destacadas(noticias, n=8)
 destacadas_final = seleccionar_destacadas(noticias, n=4)
 print(f"  → Total: {len(noticias)} | Destacadas: {len(destacadas_final)}")
-for d in destacadas_final:
-    print(f"    score={d['score']} [{d['medio']}] {d['titulo'][:70]}")
 
 
 # ---------------------------------------------------------------
-# SNAPSHOTS con FIX 1D
+# SNAPSHOTS
 # ---------------------------------------------------------------
 def snapshot_ratio(col):
     if col not in df_final.columns:
@@ -1074,16 +1112,12 @@ def snapshot_ratio(col):
     if serie.empty:
         return None
     val = float(serie[col].iloc[-1])
-
-    # FIX 1D: usar último valor distinto disponible (no "ayer exacto")
     v1d = get_last_distinct_trading_day_value(df_final, col)
     v1m = get_historical_value(df_final, col, 30)
     v1a = get_historical_value(df_final, col, 365)
-
     d1 = pct_change(val, v1d)
     m1 = pct_change(val, v1m)
     a1 = pct_change(val, v1a)
-
     return {
         "val": round(val, 2),
         "mode": "ratio",
@@ -1154,19 +1188,6 @@ snapshots = {
     "brecha_ccl": snapshot_pp("Brecha_CCL"),
     "riesgo_pais": snapshot_points("Riesgo_Pais"),
 }
-
-# Portfolio snapshots
-portfolio_tickers = ["NVDA", "MELI", "MSFT", "GOOGL", "VIST", "YPF", "PAMP", "GGAL_ADR", "META", "BTC"]
-portfolio_snapshots = {}
-for pt in portfolio_tickers:
-    snap = snapshot_ratio(pt)
-    if snap:
-        display_name = {
-            "NVDA": "NVIDIA", "MELI": "MELI", "MSFT": "MICROSOFT",
-            "GOOGL": "GOOGLE", "VIST": "VISTA", "YPF": "YPF",
-            "PAMP": "PAMPA", "GGAL_ADR": "GALICIA", "META": "META", "BTC": "BITCOIN"
-        }.get(pt, pt)
-        portfolio_snapshots[display_name] = snap
 
 
 # ---------------------------------------------------------------
@@ -1259,19 +1280,11 @@ financiamiento_1a = {
     "Cheques SGR descuento": costo_fin_usd(tasas_fin["sgr_cheque"], 12, bench_1a),
 }
 
-print(f"  ✓ Valor real 1M: {valor_real_1m}")
-print(f"  ✓ Financiamiento 1M: {financiamiento_1m}")
-
 
 # ---------------------------------------------------------------
-# PROMPTS (todos mejorados)
+# PROMPTS LLM
 # ---------------------------------------------------------------
 def build_prompt_resumen():
-    """
-    FIX: ahora el prompt separa claramente DATOS de NOTICIAS y le pide al LLM:
-    - "mundo"/"argentina": mezcla datos con tema de noticias
-    - "a_mirar": catalizadores concretos próximas 48-72h, aunque no estén en las noticias
-    """
     def fmt_ratio(label, s, prefix=""):
         if not s:
             return f"- {label}: sin datos"
@@ -1326,19 +1339,37 @@ NOTICIAS TOP (últimas 48h):
 
 Devolvé JSON con 3 campos:
 
-- "mundo": una línea que combine un dato del bloque DATOS MUNDO con el tema concreto de alguna noticia mundial. Máximo 160 caracteres.
+- "mundo": una línea que combine un dato del bloque DATOS MUNDO con tema concreto de noticia mundial. Máx 160 chars.
 
-- "argentina": una línea que combine un dato del bloque DATOS ARGENTINA con el tema concreto de alguna noticia argentina. Máximo 160 caracteres.
+- "argentina": una línea que combine un dato del bloque DATOS ARGENTINA con tema concreto de noticia argentina. Máx 160 chars.
 
-- "a_mirar": SIEMPRE tenés que indicar algo concreto. Elegí UNO de estos enfoques:
-  a) Si hay noticia con evento/dato próximo → mencionarlo (ej: "dato IPC viernes", "licitación martes").
-  b) Si no hay eventos duros → mencionar un catalizador probable basado en los datos (ej: "riesgo país cerca de 700bps, atención a bonos soberanos", "brecha CCL subiendo, foco en próximas medidas BCRA").
-  NUNCA devuelvas "Sin eventos destacados" ni texto vacío. Máximo 160 caracteres.
+- "a_mirar": SIEMPRE indicar algo concreto. Elegí UNO:
+  a) Si hay noticia con evento/dato próximo → mencionarlo.
+  b) Si no → catalizador probable según los datos (ej: "riesgo país cerca de 700bps, atento a bonos").
+  NUNCA devolver "Sin eventos destacados". Máx 160 chars.
 
-Formato JSON sin markdown:
-{{"mundo": "...", "argentina": "...", "a_mirar": "..."}}
+JSON: {{"mundo": "...", "argentina": "...", "a_mirar": "..."}}
 
-REGLAS: no inventes eventos, no recomiendes comprar/vender, no predigas precios. Español rioplatense, sin emojis, JSON puro."""
+REGLAS: no inventar eventos, no recomendar comprar/vender, no predecir precios, rioplatense, sin emojis, JSON puro."""
+
+
+def build_prompt_destacadas():
+    noticias_list = "\n".join([
+        f"{i+1}. [{n['medio']}] {n['titulo']} | URL: {n['url']}"
+        for i, n in enumerate(destacadas_final)
+    ])
+    return f"""Analista financiero. 4 noticias pre-seleccionadas:
+
+{noticias_list}
+
+Para cada una, generá 'por_que_importa' (80 caracteres máx, concreto).
+
+JSON: {{"destacadas": [
+  {{"titular": "<exacto>", "medio": "<exacto>", "url": "<exacta>", "por_que_importa": "..."}},
+  ...4 items
+]}}
+
+REGLAS: URLs y titulares exactos, no inventar, rioplatense, sin emojis, JSON puro."""
 
 
 def build_prompt_valor_real(rendimientos, financiamiento, bench, periodo_label):
@@ -1350,179 +1381,127 @@ def build_prompt_valor_real(rendimientos, financiamiento, bench, periodo_label):
 
     bench_str = f"{bench:+.2f}" if bench is not None else "0.00"
 
-    return f"""Analista financiero argentino. Dashboard muestra rendimientos {periodo_label.lower()} en USD.
+    return f"""Analista argentino. Rendimientos {periodo_label.lower()} en USD.
 
-INVERSIONES (retorno real USD):
+INVERSIONES (retorno USD):
 {fmt_dict(rendimientos)}
 
-FINANCIAMIENTO (costo real USD, positivo = caro):
+FINANCIAMIENTO (costo USD, positivo=caro):
 {fmt_dict(financiamiento)}
 
 Benchmark dólares quietos: {bench_str}%
 
-En 3 oraciones analizá:
-1. Qué pasó con dólares quietos en el período.
-2. Mejor y peor activo de inversión vs benchmark.
+3 oraciones:
+1. Qué pasó con dólares quietos.
+2. Mejor y peor inversión vs benchmark.
 3. Qué deuda quedó más cara/más licuada.
 
-Devolvé JSON: {{"analisis": "párrafo máx 500 chars"}}
+JSON: {{"analisis": "máx 500 chars"}}
 
-REGLAS: no recomiendes, no predigas, usá solo estos números, rioplatense, sin emojis, JSON puro."""
+REGLAS: no recomendar, no predecir, rioplatense, sin emojis, JSON puro."""
 
 
 def build_prompt_lectura_macro():
-    """
-    FIX CRÍTICO del prompt anterior: el LLM estaba invirtiendo el signo del EMAE YoY.
-    Ahora le indicamos explícitamente si es expansión o contracción.
-    """
     ipc_series = ", ".join([f"{f}:{v}%" for f, v in zip(ipc_fechas_12m, ipc_valores_12m)]) if ipc_valores_12m else "sin datos"
     emae_series = ", ".join([f"{f}:{v}" for f, v in zip(emae_fechas_12m, emae_valores_12m)]) if emae_valores_12m else "sin datos"
     sal_series = ", ".join([f"{f}:{v}" for f, v in zip(salario_real_fechas, salario_real_valores)]) if salario_real_valores else "sin datos"
 
-    # Etiquetas INEQUÍVOCAS que el LLM no puede malinterpretar
     if emae_yoy is not None:
-        emae_direccion = "EXPANSIÓN (actividad crece)" if emae_yoy > 0 else "CONTRACCIÓN (actividad cae)" if emae_yoy < 0 else "ESTANCAMIENTO"
-        emae_etiq = f"YoY={emae_yoy}% → {emae_direccion}"
+        emae_dir = "EXPANSIÓN (actividad crece)" if emae_yoy > 0 else "CONTRACCIÓN (actividad cae)" if emae_yoy < 0 else "ESTANCAMIENTO"
+        emae_etiq = f"YoY={emae_yoy}% → {emae_dir}"
     else:
         emae_etiq = "sin datos"
 
     if ipc_accel is not None:
-        ipc_direccion = "ACELERA" if ipc_accel > 0.1 else "DESACELERA" if ipc_accel < -0.1 else "ESTABLE"
-        ipc_etiq = f"aceleración={ipc_accel}pp → {ipc_direccion}"
+        ipc_dir = "ACELERA" if ipc_accel > 0.1 else "DESACELERA" if ipc_accel < -0.1 else "ESTABLE"
+        ipc_etiq = f"aceleración={ipc_accel}pp → {ipc_dir}"
     else:
         ipc_etiq = ""
 
     if salario_real_yoy is not None:
-        sal_direccion = "GANAN poder de compra" if salario_real_yoy > 0 else "PIERDEN poder de compra" if salario_real_yoy < 0 else "sin cambios"
-        sal_etiq = f"YoY={salario_real_yoy}% → salarios {sal_direccion}"
+        sal_dir = "GANAN poder de compra" if salario_real_yoy > 0 else "PIERDEN poder de compra" if salario_real_yoy < 0 else "sin cambios"
+        sal_etiq = f"YoY={salario_real_yoy}% → salarios {sal_dir}"
     else:
         sal_etiq = "sin datos"
 
-    return f"""Analista económico argentino. Datos macro últimos 12m:
+    return f"""Analista económico argentino. Datos macro 12m:
 
 IPC mensual: {ipc_series}
-  Último: {ipc_mes}% | Interanual: {ipc_yoy}% | {ipc_etiq}
+  Último: {ipc_mes}% | {ipc_etiq}
 
-EMAE (actividad económica): {emae_series}
-  Último: {emae_val} | {emae_etiq}
+EMAE: {emae_series}
+  {emae_etiq}
 
 SALARIO REAL (base 100): {sal_series}
   {sal_etiq}
 
-IMPORTANTE: usá las ETIQUETAS que te di entre paréntesis. NO inviertas el sentido.
-Si el EMAE dice EXPANSIÓN → la actividad SUBE (no decís "cae").
-Si el salario GANA poder → no decís "pierde".
+IMPORTANTE: RESPETÁ las etiquetas entre paréntesis. No inviertas sentidos.
+Si EMAE dice EXPANSIÓN → actividad SUBE (no digas "cae").
+Si salario GANA → no digas "pierde".
 
-Análisis transversal de 3 oraciones:
-1. Diagnóstico economía real usando la etiqueta de EMAE + etiqueta de IPC (ej: "actividad en expansión con inflación desacelerando = recuperación ordenada").
-2. Poder adquisitivo: qué dice la etiqueta de salario real vs la dinámica anterior.
-3. Escenario probable próximos 1-3 meses según las tendencias (no uses palabras como "podría empeorar" si los datos son positivos).
+3 oraciones:
+1. Diagnóstico economía real combinando etiqueta EMAE + etiqueta IPC.
+2. Poder adquisitivo: qué dice salario real vs dinámica anterior.
+3. Escenario 1-3 meses según tendencia.
 
-Devolvé JSON: {{"lectura_macro": "párrafo de 3 oraciones, máximo 450 caracteres"}}
+JSON: {{"lectura_macro": "3 oraciones, máx 450 chars"}}
 
-REGLAS: respetá los signos de las etiquetas. No opines política. Rioplatense, sin emojis, JSON puro."""
+REGLAS: respetar signos de etiquetas, no opinar política, rioplatense, sin emojis, JSON puro."""
 
 
 def build_prompt_expectativas():
-    fut = ", ".join([f"{f['vencimiento']}:${f['precio']}" for f in rofex_futuros[:6]]) if rofex_futuros else "sin datos"
+    fut_txt = ", ".join([f"{f['vencimiento']}:${f['precio']}" for f in rofex_futuros[:6]]) if rofex_futuros else "sin datos ROFEX"
     usd_spot = snapshots["usd_oficial"]["val"] if snapshots["usd_oficial"] else "?"
 
-    return f"""Analista argentino. Datos de expectativas de mercado:
+    return f"""Analista argentino. Datos expectativas de mercado:
 
-Dólar oficial spot: ${usd_spot}
-Futuros ROFEX: {fut}
-Ratio dólar 12m/spot: {ratio_dolar_12m_spot}x
-Devaluación anualizada implícita: {dev_anualizada_implicita}%
+Dólar spot: ${usd_spot}
+Futuros ROFEX: {fut_txt}
+Ratio 12m/spot: {ratio_dolar_12m_spot}x
+Devaluación implícita 12m: {dev_anualizada_implicita}%
 REM inflación 12m: {rem.get('inflacion_12m', 'N/D')}%
-Inflación implícita 12m: {inflacion_implicita_12m}%
+REM TC 12m esperado: ${rem.get('tc_12m', 'N/D')}
+REM tasa 12m: {rem.get('tasa_12m', 'N/D')}%
+Plazo fijo TNA: {tasa_plazo_fijo}%
 Tasa real esperada: {tasa_real_esperada}%
-Riesgo país: {macro_global['argentina'].get('cds_5y', 'N/D')} bps
+Reservas BCRA: USD {reservas_actual}M (1M: {reservas_delta_1m}%, 1A: {reservas_delta_1a}%)
+Riesgo país: {rp_arg} bps
 
-Análisis en 3 oraciones:
-1. Qué devaluación espera el mercado y si es mayor/menor a la inflación esperada (devaluación real positiva/negativa).
-2. Si la tasa real esperada es positiva/negativa, qué implica para el ahorro en pesos.
-3. Lectura del riesgo país + expectativas: ¿el mercado ve recesión, estancamiento o crecimiento próximo?
+3 oraciones:
+1. Qué devaluación espera mercado (dev implícita vs inflación esperada → dev real).
+2. Tasa real esperada positiva/negativa: qué implica para ahorro en pesos.
+3. Evolución reservas + riesgo país: ¿mercado ve recesión, estancamiento o crecimiento?
 
-Devolvé JSON: {{"analisis_expectativas": "3 oraciones, máx 500 chars"}}
+JSON: {{"analisis_expectativas": "3 oraciones, máx 500 chars"}}
 
-REGLAS: sin recomendaciones compra/venta, interpretación objetiva, rioplatense, sin emojis, JSON puro."""
+REGLAS: sin recomendaciones, interpretación objetiva, rioplatense, sin emojis, JSON puro."""
 
 
 def build_prompt_macro_global():
     bloques = []
     for pais, d in macro_global.items():
         bloques.append(
-            f"{pais.upper()}: tasa PM={d.get('tasa_pm', 'N/D')}%, "
-            f"inflación YoY={d.get('inflacion_yoy', 'N/D')}%, "
-            f"CDS/RP={d.get('cds_5y', 'N/D')}bps, bono10Y={d.get('bono_10y', 'N/D')}%"
+            f"{pais.upper()}: inflación YoY={d.get('inflacion_yoy', 'N/D')}%, "
+            f"tasa nominal={d.get('tasa_nominal', 'N/D')}%, "
+            f"TASA REAL={d.get('tasa_real', 'N/D')}%, "
+            f"riesgo={d.get('riesgo_pais', 'N/D')}bps"
         )
 
-    return f"""Analista financiero. Comparación Argentina-Chile-Brasil-EEUU:
+    return f"""Analista financiero. Comparación regional:
 
 {chr(10).join(bloques)}
 
-Análisis comparativo en 3 oraciones:
-1. Cómo se posiciona Argentina en tasa real (tasa PM - inflación) vs la región.
-2. Qué emergente (Chile/Brasil) es más barato/caro en riesgo crediticio (CDS/riesgo país).
-3. Diferencial de tasas con EEUU: implicancia para carry trade y flujos a emergentes.
+3 oraciones:
+1. Posición de Argentina en TASA REAL vs región. Tasa real alta = atrae capital pero puede frenar economía.
+2. Brasil vs Chile: cuál es más barato/caro en riesgo crediticio y por qué matters.
+3. Diferencial de tasas con EEUU y implicancia para flujos a emergentes (carry trade).
 
-Devolvé JSON: {{"analisis_global": "3 oraciones, máx 500 chars"}}
+JSON: {{"analisis_global": "3 oraciones, máx 500 chars"}}
 
-REGLAS: sin recomendaciones, usá solo estos datos, rioplatense, sin emojis, JSON puro."""
-
-
-def build_prompt_portfolio():
-    activos_txt = "\n".join([
-        f"- {k}: {v['val']} USD (1M: {v['m1']:+.1f}%, 1A: {v['a1']:+.1f}%)"
-        if v and v['m1'] is not None and v['a1'] is not None
-        else f"- {k}: sin datos"
-        for k, v in portfolio_snapshots.items()
-    ])
-
-    return f"""Analista financiero global. Portfolio:
-{activos_txt}
-
-Análisis sectorial prospectivo en 3 oraciones:
-1. Sectores representados (tech USA: NVDA/MSFT/GOOGL/META; energía AR: VIST/YPF/PAMP; financiero AR: GALICIA; cripto: BTC; e-commerce LATAM: MELI) y cuál performó mejor 12m.
-2. Riesgo principal del portfolio (concentración: ¿geográfica, sectorial, régimen argentino?).
-3. Perspectiva 6 meses: qué sector tiene catalizadores favorables (ej: tech con IA, energía AR con Vaca Muerta) y cuál enfrenta vientos en contra.
-
-Devolvé JSON: {{"analisis_portfolio": "3 oraciones, máx 500 chars"}}
-
-REGLAS: analizá SECTORES no activos individuales, sin recomendaciones compra/venta, rioplatense, sin emojis, JSON puro."""
+REGLAS: sin recomendaciones, usar solo estos datos, rioplatense, sin emojis, JSON puro."""
 
 
-def build_prompt_inmobiliario():
-    venta = m2_actual.get("venta_m2_usd", "N/D")
-    const = m2_actual.get("construccion_m2_usd", "N/D")
-    ratio_vc = round(venta / const, 2) if isinstance(venta, (int, float)) and isinstance(const, (int, float)) and const > 0 else None
-
-    return f"""Analista inmobiliario argentino.
-
-CABA precios USD/m²:
-- Venta usado: {venta} (YoY: {m2_venta_yoy}%)
-- Costo construcción: {const} (YoY: {m2_const_yoy}%)
-- Ratio venta/construcción: {ratio_vc}
-- Años de recupero alquiler: {años_recupero}
-- Escrituras CABA último mes: {escrit_caba['actual']} (YoY: {escrit_caba['yoy_pct']}%)
-- Escrituras CBA último mes: {escrit_cba['actual']} (YoY: {escrit_cba['yoy_pct']}%)
-
-Costos construcción (USD, vs hace 1 año):
-- Cemento bolsa: {costos_const['cemento_bolsa_50kg']['hace_1a_usd']} → {costos_const['cemento_bolsa_50kg']['actual_usd']}
-- Acero tonelada: {costos_const['acero_tonelada']['hace_1a_usd']} → {costos_const['acero_tonelada']['actual_usd']}
-- Mano de obra: {costos_const['mano_obra_jornal']['hace_1a_usd']} → {costos_const['mano_obra_jornal']['actual_usd']}
-
-Análisis en 3 oraciones:
-1. Diagnóstico: precios en USD expansión/contracción, y si las escrituras muestran actividad sana.
-2. Construir vs comprar usado: si ratio venta/construcción > 1.8 conviene construir; si <1.5 conviene usado.
-3. Recomendación con sesgo claro: horizonte 3-5 años, ¿usado o construcción nueva? Justificá con los números.
-
-Devolvé JSON: {{"analisis_inmo": "3 oraciones, máx 500 chars"}}
-
-REGLAS: recomendación clara justificada, sin mencionar desarrolladores, rioplatense, sin emojis, JSON puro."""
-
-
-def llamar_gemini(prompt, intentos=3, model=GEMINI_MODEL):
+def llamar_gemini(prompt, intentos=3, model=GEMINI_MODEL_FLASH):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
@@ -1541,20 +1520,14 @@ def llamar_gemini(prompt, intentos=3, model=GEMINI_MODEL):
                 data = r.json()
                 if "candidates" in data and data["candidates"]:
                     cand = data["candidates"][0]
-                    finish = cand.get("finishReason", "unknown")
                     content = cand.get("content", {})
                     parts = content.get("parts", [])
                     if parts and "text" in parts[0]:
                         return parts[0]["text"]
-                    print(f"  ⚠ Intento {i+1}: prompt_size={prompt_size}, finish={finish}")
-                else:
-                    print(f"  ⚠ Intento {i+1}: sin candidates")
-            else:
-                print(f"  ⚠ Intento {i+1}: HTTP {r.status_code}")
         except Exception as e:
-            print(f"  ⚠ Intento {i+1}: {e}")
-        time.sleep(5)
-    print(f"  ✗ Gemini falló tras {intentos} intentos (prompt {prompt_size} chars)")
+            print(f"  ⚠ Intento {i+1} ({model}): {e}")
+        time.sleep(3)
+    print(f"  ✗ Gemini {model} falló ({prompt_size} chars)")
     return None
 
 
@@ -1573,33 +1546,18 @@ def parsear_json(texto):
             return None
 
 
-def build_prompt_destacadas():
-    noticias_list = "\n".join([
-        f"{i+1}. [{n['medio']}] {n['titulo']} | URL: {n['url']}"
-        for i, n in enumerate(destacadas_final)
-    ])
-    return f"""Analista financiero. 4 noticias pre-seleccionadas por score:
+# Llamadas LLM (6 total)
+print("\n  → Llamada 1: resumen (Gemini Pro, más robusto)...")
+# Primero intentamos Pro (más confiable), si falla caemos a Flash
+resp_resumen_txt = llamar_gemini(build_prompt_resumen(), intentos=2, model=GEMINI_MODEL_PRO)
+if not resp_resumen_txt:
+    print("  → Fallback a Flash...")
+    resp_resumen_txt = llamar_gemini(build_prompt_resumen(), intentos=2, model=GEMINI_MODEL_FLASH)
 
-{noticias_list}
-
-Para cada una, genera 'por_que_importa' (80 caracteres máx, concreto, que el lector entienda por qué leer la nota).
-
-Devolvé JSON: {{"destacadas": [
-  {{"titular": "<exacto>", "medio": "<exacto>", "url": "<exacta>", "por_que_importa": "..."}},
-  ...4 items...
-]}}
-
-REGLAS: URLs y titulares exactos del input, no inventes, rioplatense, sin emojis, JSON puro."""
-
-
-# ---------------------------------------------------------------
-# LLAMADAS LLM
-# ---------------------------------------------------------------
-print("\n  → Llamada 1: resumen diario...")
-resp_resumen = parsear_json(llamar_gemini(build_prompt_resumen())) or {
-    "mundo": "Sin análisis disponible",
-    "argentina": "Sin análisis disponible",
-    "a_mirar": "Datos macro en observación",
+resp_resumen = parsear_json(resp_resumen_txt) or {
+    "mundo": "Análisis en procesamiento",
+    "argentina": "Análisis en procesamiento",
+    "a_mirar": "Datos macro en observación continua",
 }
 
 print("  → Llamada 2: destacadas...")
@@ -1623,21 +1581,13 @@ print("  → Llamada 5: lectura macro Argentina...")
 resp_macro = parsear_json(llamar_gemini(build_prompt_lectura_macro())) or {}
 lectura_macro = resp_macro.get("lectura_macro", "Sin análisis disponible")
 
-print("  → Llamada 6: expectativas...")
-resp_exp = parsear_json(llamar_gemini(build_prompt_expectativas())) or {}
-analisis_expectativas = resp_exp.get("analisis_expectativas", "Sin análisis disponible")
-
-print("  → Llamada 7: macro global...")
+print("  → Llamada 6: macro global...")
 resp_global = parsear_json(llamar_gemini(build_prompt_macro_global())) or {}
 analisis_global = resp_global.get("analisis_global", "Sin análisis disponible")
 
-print("  → Llamada 8: portfolio...")
-resp_port = parsear_json(llamar_gemini(build_prompt_portfolio())) or {}
-analisis_portfolio = resp_port.get("analisis_portfolio", "Sin análisis disponible")
-
-print("  → Llamada 9: inmobiliario...")
-resp_inmo = parsear_json(llamar_gemini(build_prompt_inmobiliario())) or {}
-analisis_inmo = resp_inmo.get("analisis_inmo", "Sin análisis disponible")
+print("  → Llamada 7: expectativas...")
+resp_exp = parsear_json(llamar_gemini(build_prompt_expectativas())) or {}
+analisis_expectativas = resp_exp.get("analisis_expectativas", "Sin análisis disponible")
 
 
 # ---------------------------------------------------------------
@@ -1669,8 +1619,6 @@ insights_df = pd.DataFrame({
     "lectura_macro": [lectura_macro],
     "analisis_expectativas": [analisis_expectativas],
     "analisis_global": [analisis_global],
-    "analisis_portfolio": [analisis_portfolio],
-    "analisis_inmo": [analisis_inmo],
     "bench_1m": [bench_1m if bench_1m is not None else ""],
     "bench_1a": [bench_1a if bench_1a is not None else ""],
     "ipc_mes": [ipc_mes if ipc_mes is not None else ""],
@@ -1681,7 +1629,6 @@ insights_df = pd.DataFrame({
     "emae_age_days": [emae_age_days if emae_age_days is not None else ""],
     "salario_real_yoy": [salario_real_yoy if salario_real_yoy is not None else ""],
     "salario_real_age_days": [salario_real_age_days if salario_real_age_days is not None else ""],
-    "salario_fuente": [salario_fuente_usada or ""],
     "ipc_serie_json": [json.dumps({"fechas": ipc_fechas_12m, "valores": ipc_valores_12m}, ensure_ascii=False)],
     "emae_serie_json": [json.dumps({"fechas": emae_fechas_12m, "valores": emae_valores_12m}, ensure_ascii=False)],
     "salario_real_serie_json": [json.dumps({"fechas": salario_real_fechas, "valores": salario_real_valores}, ensure_ascii=False)],
@@ -1698,18 +1645,11 @@ insights_df = pd.DataFrame({
     "ratio_dolar_12m_spot": [ratio_dolar_12m_spot if ratio_dolar_12m_spot else ""],
     "dev_anualizada_implicita": [dev_anualizada_implicita if dev_anualizada_implicita else ""],
     "tasa_plazo_fijo": [tasa_plazo_fijo if tasa_plazo_fijo else ""],
+    "reservas_actual_usd_mm": [reservas_actual if reservas_actual else ""],
+    "reservas_delta_1m": [reservas_delta_1m if reservas_delta_1m else ""],
+    "reservas_delta_1a": [reservas_delta_1a if reservas_delta_1a else ""],
     "vencimientos_deuda_json": [json.dumps(vencimientos_deuda, ensure_ascii=False)],
     "macro_global_json": [json.dumps(macro_global, ensure_ascii=False)],
-    "portfolio_json": [json.dumps(portfolio_snapshots, ensure_ascii=False)],
-    "m2_actual_json": [json.dumps(m2_actual, ensure_ascii=False)],
-    "m2_venta_yoy": [m2_venta_yoy if m2_venta_yoy else ""],
-    "m2_const_yoy": [m2_const_yoy if m2_const_yoy else ""],
-    "escrituras_caba_json": [json.dumps(escrit_caba, ensure_ascii=False)],
-    "escrituras_cba_json": [json.dumps(escrit_cba, ensure_ascii=False)],
-    "costos_construccion_json": [json.dumps(costos_const, ensure_ascii=False)],
-    "creditos_hipot_json": [json.dumps(creditos_hipot, ensure_ascii=False)],
-    "anios_recupero_alquiler": [años_recupero if años_recupero else ""],
-    "anios_recupero_yoy": [años_recupero_yoy if años_recupero_yoy else ""],
 })
 write_ws("DB_Insights", insights_df)
 print("  ✓ DB_Insights")
@@ -1720,5 +1660,5 @@ if noticias:
     print(f"  ✓ DB_Noticias: {len(df_news)} noticias")
 
 print("\n" + "=" * 60)
-print("Pipeline V20 - Completado")
+print("Pipeline V21 - Completado")
 print("=" * 60)
