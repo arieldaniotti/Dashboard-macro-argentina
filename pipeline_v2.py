@@ -485,29 +485,26 @@ if not df_is_raw.empty and not df_ipc.empty:
     merged = df_s.merge(df_i[["ym", "IPC"]], on="ym", how="inner").sort_values("ym").reset_index(drop=True)
     print(f"  • Merge salarios+IPC: {len(merged)} filas")
 
-    # Necesitamos al menos 13 meses (mes 0 = base + 12 meses adelante)
-    if len(merged) >= 13:
-        # Tomar últimos 13 meses
-        slice_ = merged.tail(13).reset_index(drop=True)
+    # FIX: aceptamos desde 12 meses (mes 0 + 11 meses) en vez de 13
+    # Esto evita None cuando el merge da 12 filas exactas
+    if len(merged) >= 12:
+        # Tomar últimos N meses (donde N entre 12 y 13)
+        n_meses = min(13, len(merged))
+        slice_ = merged.tail(n_meses).reset_index(drop=True)
 
-        # Base 100 = Índice de Salarios del primer mes de la ventana (hace 12 meses)
+        # Base = Índice de Salarios del primer mes de la ventana
         is_base = slice_.iloc[0]["IS"]
 
         # Acumulamos inflación mes a mes
         ipc_acum = 1.0
         for i in range(1, len(slice_)):
             ipc_acum *= (1 + slice_.iloc[i]["IPC"] / 100)
-
-            # Salario real = (Índice salarios actual / base) / inflación acumulada * 100
-            # Si vale > 100 → salarios crecen MÁS que inflación (ganan poder de compra)
-            # Si vale < 100 → salarios crecen MENOS que inflación (pierden poder de compra)
             is_actual = slice_.iloc[i]["IS"]
             salario_real = (is_actual / is_base) / ipc_acum * 100
             salario_real_valores.append(round(salario_real, 2))
             salario_real_fechas.append(slice_.iloc[i]["ym"].strftime("%b %y"))
 
         if salario_real_valores:
-            # YoY = último valor - 100 (base hace 12 meses)
             salario_real_yoy = round(salario_real_valores[-1] - 100, 2)
 
         salario_real_age_days = (pd.Timestamp.now() - df_is_raw["fecha"].iloc[-1]).days
@@ -520,11 +517,48 @@ print(f"  ✓ Salario real: YoY={salario_real_yoy}% | age={salario_real_age_days
 # ---------------------------------------------------------------
 print("\n[6/10] BCRA API v4.0...")
 
-BCRA_V4_BASE = "https://api.bcra.gob.ar/estadisticas/v4.0/Monetarias"
+# BCRA v4.0 - URL en MINÚSCULA según doc oficial
+BCRA_V4_BASE = "https://api.bcra.gob.ar/estadisticas/v4.0/monetarias"
+
+
+def listar_variables_bcra():
+    """Lista TODAS las variables disponibles en v4.0 con sus IDs.
+    Esto nos permite buscar por descripción y no depender de IDs hardcodeados."""
+    try:
+        r = requests.get(BCRA_V4_BASE, headers=HEADERS, params={"limit": 1500}, timeout=45, verify=False)
+        if r.status_code != 200:
+            print(f"  ⚠ BCRA listado HTTP {r.status_code}")
+            return []
+        d = r.json()
+        return d.get("results", [])
+    except Exception as e:
+        print(f"  ⚠ BCRA listado: {e}")
+        return []
+
+
+def buscar_id_bcra(catalogo, *keywords_must_have):
+    """Busca un idVariable cuya descripción contenga todas las keywords."""
+    keywords = [k.lower() for k in keywords_must_have]
+    candidatos = []
+    for var in catalogo:
+        desc = str(var.get("descripcion", "")).lower()
+        if all(k in desc for k in keywords):
+            candidatos.append(var)
+    if not candidatos:
+        return None, None
+    # Preferir el que tenga "ultValorInformado" no nulo
+    candidatos_validos = [c for c in candidatos if c.get("ultValorInformado") is not None]
+    if candidatos_validos:
+        elegido = candidatos_validos[0]
+    else:
+        elegido = candidatos[0]
+    return elegido.get("idVariable"), elegido.get("descripcion")
 
 
 def fetch_bcra_v4(var_id, desde=None, hasta=None):
-    """API BCRA v4.0 Monetarias."""
+    """API BCRA v4.0 - estructura nueva: results[0].detalle[]"""
+    if var_id is None:
+        return []
     url = f"{BCRA_V4_BASE}/{var_id}"
     params = {"limit": 3000}
     if desde:
@@ -535,7 +569,15 @@ def fetch_bcra_v4(var_id, desde=None, hasta=None):
         r = requests.get(url, headers=HEADERS, params=params, timeout=30, verify=False)
         if r.status_code == 200:
             d = r.json()
-            return d.get("results", [])
+            results = d.get("results", [])
+            if results and isinstance(results, list):
+                # Estructura v4.0: results[0]["detalle"] = lista de {fecha, valor}
+                primer = results[0]
+                if isinstance(primer, dict) and "detalle" in primer:
+                    return primer.get("detalle", [])
+                # Compatibilidad: a veces results es plano
+                return results
+            return []
         print(f"  ⚠ BCRA v4 var {var_id}: HTTP {r.status_code}")
         return []
     except Exception as e:
@@ -544,18 +586,23 @@ def fetch_bcra_v4(var_id, desde=None, hasta=None):
 
 
 def get_tasa_actual(var_id):
+    if var_id is None:
+        return None
     res = fetch_bcra_v4(var_id, desde=(HOY - timedelta(days=30)).strftime("%Y-%m-%d"))
     if not res:
         return None
     try:
-        # La API ahora devuelve results ordenados, tomamos el último
-        return float(res[-1]["valor"])
+        return float(res[0]["valor"])  # v4 devuelve ordenado descendente
     except Exception:
-        return None
+        try:
+            return float(res[-1]["valor"])
+        except Exception:
+            return None
 
 
 def get_serie_bcra(var_id, dias=400):
-    """Devuelve DataFrame con fecha y valor."""
+    if var_id is None:
+        return pd.DataFrame()
     res = fetch_bcra_v4(var_id, desde=(HOY - timedelta(days=dias)).strftime("%Y-%m-%d"))
     if not res:
         return pd.DataFrame()
@@ -569,20 +616,38 @@ def get_serie_bcra(var_id, dias=400):
         return pd.DataFrame()
 
 
-# IDs BCRA v4.0 (confirmados):
-# 1 = Reservas internacionales (USD millones)
-# 6 = Tipo Cambio Mayorista (Com. A 3500)
-# 7 = BADLAR Bancos Privados (TNA)
-# 8 = TM20 Bancos Privados
-# 34 = Tasa Plazo Fijo 30 días (TNA)
-# 160 = TAMAR Bancos Privados (TNA) - nueva tasa referencia
-tasa_plazo_fijo = get_tasa_actual(34)
-tasa_badlar = get_tasa_actual(7)
-tasa_tm20 = get_tasa_actual(8)
-tasa_tamar = get_tasa_actual(160)
+# Buscar IDs dinámicamente (más robusto que hardcodear)
+print("  → Listando variables BCRA v4.0...")
+catalogo_bcra = listar_variables_bcra()
+print(f"  ✓ Variables BCRA disponibles: {len(catalogo_bcra)}")
+
+if catalogo_bcra:
+    id_reservas, desc_reservas = buscar_id_bcra(catalogo_bcra, "reservas", "internacional")
+    id_pf, desc_pf = buscar_id_bcra(catalogo_bcra, "plazo fijo")
+    id_badlar, desc_badlar = buscar_id_bcra(catalogo_bcra, "badlar", "privado")
+    id_tamar, desc_tamar = buscar_id_bcra(catalogo_bcra, "tamar")
+    id_tm20, desc_tm20 = buscar_id_bcra(catalogo_bcra, "tm20")
+
+    print(f"  • Reservas: id={id_reservas} — {desc_reservas}")
+    print(f"  • Plazo Fijo: id={id_pf} — {desc_pf}")
+    print(f"  • BADLAR: id={id_badlar} — {desc_badlar}")
+    print(f"  • TAMAR: id={id_tamar} — {desc_tamar}")
+    print(f"  • TM20: id={id_tm20} — {desc_tm20}")
+else:
+    id_reservas = id_pf = id_badlar = id_tamar = id_tm20 = None
+
+tasa_plazo_fijo = get_tasa_actual(id_pf)
+tasa_badlar = get_tasa_actual(id_badlar)
+tasa_tm20 = get_tasa_actual(id_tm20)
+tasa_tamar = get_tasa_actual(id_tamar)
+
+# Si plazo fijo es None, usar TAMAR como referencia (es la nueva tasa de referencia oficial)
+if tasa_plazo_fijo is None and tasa_tamar is not None:
+    print(f"  → Plazo Fijo no disponible, uso TAMAR como referencia: {tasa_tamar}%")
+    tasa_plazo_fijo = tasa_tamar
 
 # Serie de reservas para calcular deltas
-df_reservas = get_serie_bcra(1, dias=400)
+df_reservas = get_serie_bcra(id_reservas, dias=400)
 reservas_actual = None
 reservas_1m = None
 reservas_1a = None
@@ -703,7 +768,7 @@ tickers = {
     "BTC": "BTC-USD",
     "Oro": "GC=F",
     "Brent": "BZ=F",
-    "AL30": "AL30.BA",
+    "AL30": "AL30D.BA",  # FIX: AL30D es la versión USD-LIQ que sí está disponible
     "GGAL_ADR": "GGAL",
     "GGAL_LOC": "GGAL.BA",
     "US10Y": "^TNX",
@@ -753,47 +818,39 @@ print(f"  ✓ df_final: {len(df_final)} filas")
 print("\n[9/10] Macro global...")
 
 
-def fetch_fred_api(serie_id):
-    """FRED con API key."""
+def fetch_fred_api(serie_id, max_intentos=3):
+    """FRED con timeout largo, retry y API key obligatoria."""
     if not FRED_API_KEY:
-        # Fallback: CSV público
-        url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={serie_id}"
-        df = fetch_csv(url)
-        if df.empty:
-            return pd.DataFrame()
-        df.columns = ["fecha"] + list(df.columns[1:])
-        df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
-        val_col = df.columns[1]
-        df[val_col] = df[val_col].replace(".", pd.NA)
-        df[val_col] = pd.to_numeric(df[val_col], errors="coerce")
-        df = df.dropna().sort_values("fecha").reset_index(drop=True)
-        df = df.rename(columns={val_col: "valor"})
-        return df[["fecha", "valor"]]
+        print(f"  ⚠ FRED {serie_id}: sin API key")
+        return pd.DataFrame()
 
-    url = f"https://api.stlouisfed.org/fred/series/observations"
+    url = "https://api.stlouisfed.org/fred/series/observations"
     params = {
         "series_id": serie_id,
         "api_key": FRED_API_KEY,
         "file_type": "json",
         "observation_start": (HOY - timedelta(days=400)).strftime("%Y-%m-%d"),
     }
-    try:
-        r = requests.get(url, params=params, timeout=20)
-        if r.status_code != 200:
-            print(f"  ⚠ FRED {serie_id}: HTTP {r.status_code}")
-            return pd.DataFrame()
-        data = r.json()
-        obs = data.get("observations", [])
-        if not obs:
-            return pd.DataFrame()
-        df = pd.DataFrame(obs)
-        df["fecha"] = pd.to_datetime(df["date"], errors="coerce")
-        df["valor"] = pd.to_numeric(df["value"], errors="coerce")
-        df = df.dropna(subset=["fecha", "valor"]).sort_values("fecha").reset_index(drop=True)
-        return df[["fecha", "valor"]]
-    except Exception as e:
-        print(f"  ⚠ FRED {serie_id}: {e}")
-        return pd.DataFrame()
+    for intento in range(max_intentos):
+        try:
+            r = requests.get(url, params=params, timeout=60)  # FIX: 60s en vez de 20s
+            if r.status_code != 200:
+                print(f"  ⚠ FRED {serie_id} intento {intento+1}: HTTP {r.status_code}")
+                time.sleep(3)
+                continue
+            data = r.json()
+            obs = data.get("observations", [])
+            if not obs:
+                return pd.DataFrame()
+            df = pd.DataFrame(obs)
+            df["fecha"] = pd.to_datetime(df["date"], errors="coerce")
+            df["valor"] = pd.to_numeric(df["value"], errors="coerce")
+            df = df.dropna(subset=["fecha", "valor"]).sort_values("fecha").reset_index(drop=True)
+            return df[["fecha", "valor"]]
+        except Exception as e:
+            print(f"  ⚠ FRED {serie_id} intento {intento+1}: {e}")
+            time.sleep(5)
+    return pd.DataFrame()
 
 
 def ultimo_valor(df):
@@ -1066,10 +1123,29 @@ def fetch_rofex_con_pyrofex():
 rofex_futuros = fetch_rofex_con_pyrofex()
 
 
-# REM via API de Facundo Allia (verificada)
+# REM via API de Facundo Allia (con retry para 429)
+def fetch_rem_endpoint(endpoint, max_intentos=3):
+    """Fetch con retry específico para HTTP 429."""
+    url = f"https://bcra-rem-api.facujallia.workers.dev/api/{endpoint}"
+    for i in range(max_intentos):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=30)
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code == 429:
+                wait = (i + 1) * 8  # 8s, 16s, 24s
+                print(f"  • REM {endpoint}: 429, esperando {wait}s...")
+                time.sleep(wait)
+                continue
+            print(f"  ⚠ REM {endpoint}: HTTP {r.status_code}")
+            return None
+        except Exception as e:
+            print(f"  ⚠ REM {endpoint}: {e}")
+            time.sleep(3)
+    return None
+
+
 def fetch_rem_api():
-    """API pública con REM parseado. Endpoints: ipc_general, tipo_cambio, tasa_interes, pbi."""
-    base = "https://bcra-rem-api.facujallia.workers.dev/api"
     out = {
         "inflacion_mensual_proxima": None,
         "inflacion_12m": None,
@@ -1079,41 +1155,36 @@ def fetch_rem_api():
     }
 
     # Inflación
-    data = fetch_json(f"{base}/ipc_general")
+    data = fetch_rem_endpoint("ipc_general")
     if data and "datos" in data:
         for row in data["datos"]:
             ref = str(row.get("referencia", "")).lower()
             if "próx. 12 meses" in ref or "prox. 12 meses" in ref:
                 out["inflacion_12m"] = row.get("mediana")
-            # Primera proyección mensual (mes siguiente)
             if "mensual" in ref and out["inflacion_mensual_proxima"] is None:
                 out["inflacion_mensual_proxima"] = row.get("mediana")
 
-    # Tipo de cambio
-    time.sleep(1)  # evitar rate limit
-    data = fetch_json(f"{base}/tipo_cambio")
+    time.sleep(4)
+    data = fetch_rem_endpoint("tipo_cambio")
     if data and "datos" in data:
         for row in data["datos"]:
             ref = str(row.get("referencia", "")).lower()
             if "próx. 12 meses" in ref or "prox. 12 meses" in ref:
                 out["tc_12m"] = row.get("mediana")
 
-    # Tasa
-    time.sleep(1)
-    data = fetch_json(f"{base}/tasa_interes")
+    time.sleep(4)
+    data = fetch_rem_endpoint("tasa_interes")
     if data and "datos" in data:
         for row in data["datos"]:
             ref = str(row.get("referencia", "")).lower()
             if "próx. 12 meses" in ref or "prox. 12 meses" in ref:
                 out["tasa_12m"] = row.get("mediana")
 
-    # PBI
-    time.sleep(1)
-    data = fetch_json(f"{base}/pbi")
+    time.sleep(4)
+    data = fetch_rem_endpoint("pbi")
     if data and "datos" in data:
         datos = data["datos"]
         if datos:
-            # Tomar primer dato disponible
             out["pbi_trim"] = datos[0].get("mediana")
 
     return out
@@ -1762,6 +1833,7 @@ def llamar_gemini(prompt, intentos=3, model=GEMINI_MODEL_FLASH):
         },
     }
     prompt_size = len(prompt)
+    last_error = None
     for i in range(intentos):
         try:
             r = requests.post(url, json=payload, timeout=90)
@@ -1773,10 +1845,24 @@ def llamar_gemini(prompt, intentos=3, model=GEMINI_MODEL_FLASH):
                     parts = content.get("parts", [])
                     if parts and "text" in parts[0]:
                         return parts[0]["text"]
+                last_error = f"200 OK pero respuesta sin candidates: {str(data)[:200]}"
+            else:
+                # FIX: log detallado del error
+                try:
+                    err_body = r.json()
+                    err_msg = err_body.get("error", {}).get("message", str(err_body)[:200])
+                    err_status = err_body.get("error", {}).get("status", "")
+                    last_error = f"HTTP {r.status_code} [{err_status}]: {err_msg[:200]}"
+                except Exception:
+                    last_error = f"HTTP {r.status_code}: {r.text[:200]}"
+                # Si es error de auth, no reintentar
+                if r.status_code in (401, 403):
+                    print(f"  ✗ Gemini {model} ERROR AUTH: {last_error}")
+                    return None
         except Exception as e:
-            print(f"  ⚠ Intento {i+1} ({model}): {e}")
+            last_error = str(e)[:200]
         time.sleep(3)
-    print(f"  ✗ Gemini {model} falló ({prompt_size} chars)")
+    print(f"  ✗ Gemini {model} falló ({prompt_size} chars). Último error: {last_error}")
     return None
 
 
