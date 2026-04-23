@@ -186,7 +186,13 @@ EMAE_XLS_URL = "https://www.indec.gob.ar/ftp/cuadros/economia/sh_emae_mensual_ba
 def fetch_emae_from_indec_xls():
     """
     Descarga el XLS oficial del EMAE base 2004 directo del INDEC.
-    Estructura típica: header en filas 1-3, después columnas con períodos y valores.
+    Estructura del Excel INDEC:
+    - Primera hoja: serie EMAE mensual
+    - Layout típico: columnas = períodos (año), filas = meses
+      O bien: columna A = fecha, columna B = Nivel General original,
+              columna C = desestacionalizada, columna D = tendencia-ciclo
+    
+    Intentamos varias estrategias de parseo.
     """
     try:
         r = requests.get(EMAE_XLS_URL, headers=HEADERS, timeout=60, verify=False)
@@ -194,70 +200,117 @@ def fetch_emae_from_indec_xls():
             print(f"  ⚠ EMAE XLS HTTP {r.status_code}")
             return pd.DataFrame()
 
-        # Guardar a temp file
         tmp_path = "/tmp/emae_indec.xls"
         with open(tmp_path, "wb") as f:
             f.write(r.content)
 
-        # Leer con pandas (xlrd para .xls antiguo)
+        # Abrir con xlrd (formato .xls antiguo)
         try:
             xls = pd.ExcelFile(tmp_path, engine="xlrd")
-        except Exception:
-            xls = pd.ExcelFile(tmp_path)
-
-        # La primera hoja típicamente contiene la serie original + desestacionalizada
-        sheet_name = xls.sheet_names[0]
-        df_raw = pd.read_excel(tmp_path, sheet_name=sheet_name, header=None)
-
-        # Buscar la fila que contiene "Año" o el primer año (2004)
-        rows = []
-        anio_actual = None
-        for idx, row in df_raw.iterrows():
+        except Exception as e:
+            print(f"  ⚠ EMAE XLS: error abrir con xlrd: {e}")
             try:
-                # Detectar año (1ra columna numérica entre 2004 y 2030)
-                first_val = row.iloc[0]
-                if pd.notna(first_val):
-                    try:
-                        anio_int = int(float(str(first_val).strip()))
-                        if 2004 <= anio_int <= 2030:
-                            anio_actual = anio_int
-                            continue
-                    except Exception:
-                        pass
+                xls = pd.ExcelFile(tmp_path)
+            except Exception as e2:
+                print(f"  ⚠ EMAE XLS: error abrir: {e2}")
+                return pd.DataFrame()
 
-                # Detectar mes (1ra columna texto = enero, febrero, etc.)
-                if anio_actual and pd.notna(first_val):
-                    mes_str = str(first_val).strip().lower()
+        print(f"  • EMAE XLS hojas disponibles: {xls.sheet_names[:5]}")
+
+        # Estrategia 1: formato "largo" (columna fecha + columnas indicadores)
+        rows_strat1 = []
+        try:
+            for sheet_name in xls.sheet_names[:3]:
+                df_raw = pd.read_excel(tmp_path, sheet_name=sheet_name, header=None, engine="xlrd")
+                # Buscar primeras filas con fecha-like
+                for idx, row in df_raw.iterrows():
+                    try:
+                        first_val = row.iloc[0]
+                        # Detectar si es fecha
+                        if pd.notna(first_val):
+                            fecha = pd.to_datetime(first_val, errors="coerce")
+                            if pd.notna(fecha) and 2004 <= fecha.year <= 2030:
+                                # Buscar valor numérico en siguientes columnas
+                                for col_idx in range(1, min(len(row), 8)):
+                                    try:
+                                        val = float(row.iloc[col_idx])
+                                        if 50 < val < 300:  # Rango plausible
+                                            rows_strat1.append({"fecha": fecha.replace(day=1), "EMAE": val})
+                                            break
+                                    except Exception:
+                                        continue
+                    except Exception:
+                        continue
+                if rows_strat1:
+                    break
+        except Exception as e:
+            print(f"  ⚠ EMAE strat1: {e}")
+
+        # Estrategia 2: formato "ancho" (columnas = años, filas = meses)
+        rows_strat2 = []
+        if not rows_strat1:
+            try:
+                sheet_name = xls.sheet_names[0]
+                df_raw = pd.read_excel(tmp_path, sheet_name=sheet_name, header=None, engine="xlrd")
+
+                # Buscar fila con años (valores 2004-2030 consecutivos)
+                anio_row_idx = None
+                for idx in range(min(10, len(df_raw))):
+                    row = df_raw.iloc[idx]
+                    anios = [v for v in row if pd.notna(v) and isinstance(v, (int, float)) and 2004 <= float(v) <= 2030]
+                    if len(anios) >= 5:
+                        anio_row_idx = idx
+                        break
+
+                if anio_row_idx is not None:
+                    # Mapear columnas a años
+                    anios_cols = {}
+                    for col_idx, val in enumerate(df_raw.iloc[anio_row_idx]):
+                        if pd.notna(val):
+                            try:
+                                anio = int(float(val))
+                                if 2004 <= anio <= 2030:
+                                    anios_cols[col_idx] = anio
+                            except Exception:
+                                continue
+
+                    # Buscar filas con meses
                     meses_map = {
                         "enero": 1, "febrero": 2, "marzo": 3, "abril": 4,
                         "mayo": 5, "junio": 6, "julio": 7, "agosto": 8,
                         "septiembre": 9, "octubre": 10, "noviembre": 11, "diciembre": 12,
                     }
-                    if mes_str in meses_map:
-                        # Tomar el primer valor numérico de las siguientes columnas
-                        # Habitualmente la columna 1 es el índice nivel general original
-                        for col_idx in range(1, min(len(row), 6)):
+                    for idx in range(anio_row_idx + 1, len(df_raw)):
+                        row = df_raw.iloc[idx]
+                        first = str(row.iloc[0]).strip().lower() if pd.notna(row.iloc[0]) else ""
+                        mes_num = meses_map.get(first)
+                        if mes_num is None:
+                            continue
+                        for col_idx, anio in anios_cols.items():
                             try:
                                 val = float(row.iloc[col_idx])
-                                if 50 < val < 300:  # Rangos plausibles para índice base 2004=100
-                                    rows.append({
-                                        "fecha": pd.Timestamp(year=anio_actual, month=meses_map[mes_str], day=1),
+                                if 50 < val < 300:
+                                    rows_strat2.append({
+                                        "fecha": pd.Timestamp(year=anio, month=mes_num, day=1),
                                         "EMAE": val,
                                     })
-                                    break
                             except Exception:
                                 continue
-            except Exception:
-                continue
+            except Exception as e:
+                print(f"  ⚠ EMAE strat2: {e}")
+
+        # Usar la estrategia que dio más filas
+        rows = rows_strat1 if len(rows_strat1) > len(rows_strat2) else rows_strat2
 
         if not rows:
-            print(f"  ⚠ EMAE XLS sin filas parseadas")
+            print(f"  ⚠ EMAE XLS sin filas parseadas (ambas estrategias fallaron)")
             return pd.DataFrame()
 
         df = pd.DataFrame(rows).drop_duplicates(subset=["fecha"]).sort_values("fecha").reset_index(drop=True)
+        print(f"  • EMAE XLS filas parseadas: {len(df)} | último {df['fecha'].max().date()} = {df['EMAE'].iloc[-1]:.2f}")
         return df
     except Exception as e:
-        print(f"  ⚠ EMAE XLS error: {e}")
+        print(f"  ⚠ EMAE XLS error: {str(e)[:150]}")
         return pd.DataFrame()
 
 
@@ -285,9 +338,17 @@ SALARIOS_CSV_URL = "https://www.indec.gob.ar/ftp/cuadros/sociedad/indice_salario
 def fetch_salarios_indec():
     """
     CSV oficial INDEC con Índice de Salarios.
-    Columnas habituales: período, nivel general, sector privado registrado,
-    sector público, sector privado no registrado.
-    Usamos NIVEL GENERAL.
+    El INDEC usa:
+    - Encoding latin-1 (ISO 8859-1)
+    - Separador ; (punto y coma)
+    - Separador decimal , (coma)
+    - Separador de miles . (punto) - IMPORTANTE: hay que removerlo ANTES de cambiar la coma
+    
+    Columna 0: fecha (formato YYYY-MM o MM/YYYY)
+    Columna 1 en adelante: índices (usamos Nivel General = col 1 o col "general")
+    
+    Valor esperado: Índice base oct-2016=100.
+    Diciembre 2025: ~45.000-50.000 (según último informe INDEC: +38,2% YoY)
     """
     try:
         r = requests.get(SALARIOS_CSV_URL, headers=HEADERS, timeout=30, verify=False)
@@ -295,59 +356,127 @@ def fetch_salarios_indec():
             print(f"  ⚠ Salarios CSV HTTP {r.status_code}")
             return pd.DataFrame()
 
-        # Probar varios encodings
+        # Probar encodings
         text = None
-        for enc in ["utf-8", "latin-1", "cp1252", "iso-8859-1"]:
+        for enc in ["latin-1", "iso-8859-1", "cp1252", "utf-8"]:
             try:
                 text = r.content.decode(enc)
                 break
             except Exception:
                 continue
         if text is None:
-            text = r.text
+            print(f"  ⚠ Salarios CSV: no pude decodificar")
+            return pd.DataFrame()
 
-        # Probar separadores
+        # INDEC usa ; como separador
+        df_raw = None
         for sep in [";", ",", "\t"]:
             try:
-                df_raw = pd.read_csv(StringIO(text), sep=sep, dtype=str)
-                if len(df_raw.columns) >= 2:
+                tmp = pd.read_csv(StringIO(text), sep=sep, dtype=str)
+                if len(tmp.columns) >= 2 and len(tmp) > 10:
+                    df_raw = tmp
                     break
             except Exception:
                 continue
 
-        if len(df_raw.columns) < 2:
-            print(f"  ⚠ Salarios CSV: estructura no reconocida")
+        if df_raw is None or df_raw.empty:
+            print(f"  ⚠ Salarios CSV: no parseable")
             return pd.DataFrame()
 
-        # Detectar columna de fecha (primera) y de nivel general (segunda)
-        col_fecha = df_raw.columns[0]
-        col_nivel = df_raw.columns[1]  # Nivel general suele ser la primera columna numérica
+        # Debug: primeras líneas
+        print(f"  • Salarios CSV cols: {list(df_raw.columns)[:10]}")
+        print(f"  • Salarios CSV primera fila: {df_raw.iloc[0].tolist()[:6]}")
+        print(f"  • Salarios CSV última fila: {df_raw.iloc[-1].tolist()[:6]}")
 
-        # Buscar columna explícita "Nivel general" si existe
+        # Detectar columna fecha (1era) y nivel general
+        col_fecha = df_raw.columns[0]
+        col_nivel = None
+
+        # PRIORIDAD 1: nombre exacto según metadatos INDEC oficial
+        # https://www.indec.gob.ar/ftp/cuadros/sociedad/metadatos_series_salarios.txt
+        # "IS_indice_total: Índice total de salarios"
         for c in df_raw.columns:
             cl = str(c).lower().strip()
-            if "nivel general" in cl or "general" in cl or "total" in cl:
+            if "is_indice_total" in cl or cl == "indice_total" or cl == "is_total":
                 col_nivel = c
+                print(f"  • Columna IS_indice_total encontrada: '{c}'")
                 break
 
-        # Parse fecha
-        df_raw["fecha"] = pd.to_datetime(df_raw[col_fecha], errors="coerce")
-        # Si fecha falló, intentar parsing manual MM/YYYY o YYYY-MM
-        if df_raw["fecha"].isna().all():
-            try:
-                df_raw["fecha"] = pd.to_datetime(df_raw[col_fecha], format="%m/%Y", errors="coerce")
-            except Exception:
-                pass
+        # PRIORIDAD 2: buscar "total" pero NO "registrado" (eso es solo privado registrado)
+        if col_nivel is None:
+            for c in df_raw.columns:
+                cl = str(c).lower().strip()
+                if ("total" in cl or "general" in cl) and "registrado" not in cl and "privado" not in cl and "publico" not in cl:
+                    col_nivel = c
+                    print(f"  • Columna nivel total encontrada: '{c}'")
+                    break
 
-        df_raw["IS"] = pd.to_numeric(
-            df_raw[col_nivel].astype(str).str.replace(",", ".").str.replace(" ", ""),
-            errors="coerce"
-        )
+        # PRIORIDAD 3: última columna numérica (heurística last resort)
+        if col_nivel is None:
+            col_nivel = df_raw.columns[-1]
+            print(f"  • Sin match exacto, uso última columna: '{col_nivel}'")
+
+        # Parse fecha: probar varios formatos
+        df_raw["fecha"] = pd.to_datetime(df_raw[col_fecha], errors="coerce")
+        if df_raw["fecha"].isna().sum() > len(df_raw) * 0.5:
+            for fmt in ["%m/%Y", "%Y-%m", "%Y/%m", "%Y-%m-%d"]:
+                try:
+                    parsed = pd.to_datetime(df_raw[col_fecha], format=fmt, errors="coerce")
+                    if parsed.isna().sum() < len(df_raw) * 0.2:
+                        df_raw["fecha"] = parsed
+                        break
+                except Exception:
+                    continue
+
+        # Parse valor: primero remover punto (miles), luego reemplazar coma (decimal) por punto
+        def parse_numero_indec(s):
+            if s is None:
+                return None
+            s = str(s).strip()
+            if not s or s.lower() in ("nan", "null", "-"):
+                return None
+            # "45.123,45" -> "45123.45"
+            # "45123,45"  -> "45123.45"
+            # "45123.45"  -> "45123.45" (ya formato US)
+            # Detectar formato: si tiene coma Y punto, la coma es decimal
+            if "," in s and "." in s:
+                # Formato europeo: punto=miles, coma=decimal
+                s = s.replace(".", "").replace(",", ".")
+            elif "," in s:
+                # Solo coma: es decimal
+                s = s.replace(",", ".")
+            # Si solo tiene punto, podría ser miles o decimal
+            # Asumimos: si tiene más de 3 dígitos después del punto, es miles
+            elif "." in s:
+                parts = s.split(".")
+                if len(parts) == 2 and len(parts[1]) == 3 and len(parts[0]) <= 3:
+                    # "45.123" formato europeo miles -> 45123
+                    s = s.replace(".", "")
+            try:
+                return float(s)
+            except Exception:
+                return None
+
+        df_raw["IS"] = df_raw[col_nivel].apply(parse_numero_indec)
 
         df = df_raw[["fecha", "IS"]].dropna().sort_values("fecha").reset_index(drop=True)
+
+        # VALIDACIÓN DE RANGO
+        # IS_indice_total oct-2016=100. Con inflación acumulada, feb-2026 debería estar en ~40.000-60.000.
+        # Si el último valor es <5000 o >200000, el parsing tomó una columna incorrecta o mal los decimales.
+        if not df.empty:
+            ultimo = df["IS"].iloc[-1]
+            print(f"  • Último valor IS parseado: {ultimo:.2f}")
+            if ultimo < 5000:
+                print(f"  ⚠ VALOR MUY BAJO ({ultimo}) - probablemente columna incorrecta, descartando")
+                return pd.DataFrame()
+            if ultimo > 200000:
+                print(f"  ⚠ VALOR MUY ALTO ({ultimo}) - probablemente decimales mal, descartando")
+                return pd.DataFrame()
+
         return df
     except Exception as e:
-        print(f"  ⚠ Salarios CSV: {e}")
+        print(f"  ⚠ Salarios CSV: {str(e)[:150]}")
         return pd.DataFrame()
 
 
@@ -678,22 +807,10 @@ def tna_a_retorno_periodo(tna, meses):
     return round(((1 + tasa_mensual) ** meses - 1) * 100, 2)
 
 
-# Estimaciones de tasas de financiamiento (basadas en BADLAR + spreads)
-def estimar_tasa_financiamiento():
-    if tasa_badlar is None:
-        return {k: None for k in ["adelanto_cta_cte", "tarjeta_credito", "prestamo_personal",
-                                   "hipotecario_uva", "sgr_cheque"]}
-    return {
-        "adelanto_cta_cte": round(tasa_badlar + 15, 1),
-        "tarjeta_credito": round(tasa_badlar + 25, 1),
-        "prestamo_personal": round(tasa_badlar + 20, 1),
-        "hipotecario_uva": 8.0,
-        "sgr_cheque": round(tasa_badlar - 5, 1),
-    }
-
-
-tasas_fin = estimar_tasa_financiamiento()
-print(f"  ✓ Financiamiento: {tasas_fin}")
+# Financiamiento eliminado: las tasas eran heurísticas (BADLAR + spread hardcoded).
+# Vos pediste sin aproximaciones. Dejamos vacíos para que el dashboard oculte la tabla.
+tasas_fin = {}
+print(f"  • Financiamiento: eliminado (no hay datos reales disponibles por API)")
 
 
 # ---------------------------------------------------------------
@@ -819,37 +936,67 @@ print("\n[9/10] Macro global...")
 
 
 def fetch_fred_api(serie_id, max_intentos=3):
-    """FRED con timeout largo, retry y API key obligatoria."""
-    if not FRED_API_KEY:
-        print(f"  ⚠ FRED {serie_id}: sin API key")
-        return pd.DataFrame()
-
-    url = "https://api.stlouisfed.org/fred/series/observations"
-    params = {
-        "series_id": serie_id,
-        "api_key": FRED_API_KEY,
-        "file_type": "json",
-        "observation_start": (HOY - timedelta(days=400)).strftime("%Y-%m-%d"),
-    }
+    """
+    FRED: si hay API key usa el endpoint JSON. Si no, usa el CSV público.
+    Ambos sin requerir cuenta (el CSV es verdaderamente público).
+    Timeout 90s + 3 reintentos con backoff.
+    """
+    # Opción A: CSV público (siempre funciona, sin key)
+    # URL: https://fred.stlouisfed.org/graph/fredgraph.csv?id={serie_id}
     for intento in range(max_intentos):
         try:
-            r = requests.get(url, params=params, timeout=60)  # FIX: 60s en vez de 20s
-            if r.status_code != 200:
-                print(f"  ⚠ FRED {serie_id} intento {intento+1}: HTTP {r.status_code}")
-                time.sleep(3)
-                continue
-            data = r.json()
-            obs = data.get("observations", [])
-            if not obs:
-                return pd.DataFrame()
-            df = pd.DataFrame(obs)
-            df["fecha"] = pd.to_datetime(df["date"], errors="coerce")
-            df["valor"] = pd.to_numeric(df["value"], errors="coerce")
-            df = df.dropna(subset=["fecha", "valor"]).sort_values("fecha").reset_index(drop=True)
-            return df[["fecha", "valor"]]
+            csv_url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={serie_id}"
+            r = requests.get(csv_url, headers=HEADERS, timeout=90)
+            if r.status_code == 200:
+                df = pd.read_csv(StringIO(r.text))
+                if df.empty or len(df.columns) < 2:
+                    continue
+                # FRED CSV: 1ra col = "DATE" o "observation_date", 2da = valor
+                col_fecha = df.columns[0]
+                col_valor = df.columns[1]
+                df = df.rename(columns={col_fecha: "fecha", col_valor: "valor"})
+                df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
+                df["valor"] = df["valor"].replace(".", pd.NA)
+                df["valor"] = pd.to_numeric(df["valor"], errors="coerce")
+                df = df.dropna().sort_values("fecha").reset_index(drop=True)
+                # Filtrar a últimos ~13 meses para el cálculo YoY
+                cutoff = HOY - timedelta(days=500)
+                df = df[df["fecha"] >= cutoff]
+                if not df.empty:
+                    return df[["fecha", "valor"]]
+            print(f"  ⚠ FRED CSV {serie_id} intento {intento+1}: HTTP {r.status_code}")
         except Exception as e:
-            print(f"  ⚠ FRED {serie_id} intento {intento+1}: {e}")
+            print(f"  ⚠ FRED CSV {serie_id} intento {intento+1}: {str(e)[:100]}")
+        time.sleep(5)
+
+    # Opción B: Si tenemos API key y el CSV falló, probar JSON
+    if FRED_API_KEY:
+        url = "https://api.stlouisfed.org/fred/series/observations"
+        params = {
+            "series_id": serie_id,
+            "api_key": FRED_API_KEY,
+            "file_type": "json",
+            "observation_start": (HOY - timedelta(days=500)).strftime("%Y-%m-%d"),
+        }
+        for intento in range(max_intentos):
+            try:
+                r = requests.get(url, params=params, timeout=60)
+                if r.status_code == 200:
+                    data = r.json()
+                    obs = data.get("observations", [])
+                    if not obs:
+                        return pd.DataFrame()
+                    df = pd.DataFrame(obs)
+                    df["fecha"] = pd.to_datetime(df["date"], errors="coerce")
+                    df["valor"] = pd.to_numeric(df["value"], errors="coerce")
+                    df = df.dropna(subset=["fecha", "valor"]).sort_values("fecha").reset_index(drop=True)
+                    return df[["fecha", "valor"]]
+                print(f"  ⚠ FRED JSON {serie_id} intento {intento+1}: HTTP {r.status_code}")
+            except Exception as e:
+                print(f"  ⚠ FRED JSON {serie_id} intento {intento+1}: {str(e)[:100]}")
             time.sleep(5)
+
+    print(f"  ✗ FRED {serie_id}: agotados todos los intentos")
     return pd.DataFrame()
 
 
@@ -1124,8 +1271,8 @@ rofex_futuros = fetch_rofex_con_pyrofex()
 
 
 # REM via API de Facundo Allia (con retry para 429)
-def fetch_rem_endpoint(endpoint, max_intentos=3):
-    """Fetch con retry específico para HTTP 429."""
+def fetch_rem_endpoint(endpoint, max_intentos=4):
+    """Fetch con retry específico para HTTP 429. Backoff: 10s, 20s, 40s, 60s."""
     url = f"https://bcra-rem-api.facujallia.workers.dev/api/{endpoint}"
     for i in range(max_intentos):
         try:
@@ -1133,15 +1280,16 @@ def fetch_rem_endpoint(endpoint, max_intentos=3):
             if r.status_code == 200:
                 return r.json()
             if r.status_code == 429:
-                wait = (i + 1) * 8  # 8s, 16s, 24s
-                print(f"  • REM {endpoint}: 429, esperando {wait}s...")
+                wait = [10, 20, 40, 60][i]
+                print(f"  • REM {endpoint}: 429, esperando {wait}s (intento {i+1}/{max_intentos})...")
                 time.sleep(wait)
                 continue
             print(f"  ⚠ REM {endpoint}: HTTP {r.status_code}")
             return None
         except Exception as e:
             print(f"  ⚠ REM {endpoint}: {e}")
-            time.sleep(3)
+            time.sleep(5)
+    print(f"  ✗ REM {endpoint}: agotados los intentos")
     return None
 
 
@@ -1154,7 +1302,6 @@ def fetch_rem_api():
         "pbi_trim": None,
     }
 
-    # Inflación
     data = fetch_rem_endpoint("ipc_general")
     if data and "datos" in data:
         for row in data["datos"]:
@@ -1164,7 +1311,8 @@ def fetch_rem_api():
             if "mensual" in ref and out["inflacion_mensual_proxima"] is None:
                 out["inflacion_mensual_proxima"] = row.get("mediana")
 
-    time.sleep(4)
+    # FIX: 15s entre llamadas para evitar 429
+    time.sleep(15)
     data = fetch_rem_endpoint("tipo_cambio")
     if data and "datos" in data:
         for row in data["datos"]:
@@ -1172,7 +1320,7 @@ def fetch_rem_api():
             if "próx. 12 meses" in ref or "prox. 12 meses" in ref:
                 out["tc_12m"] = row.get("mediana")
 
-    time.sleep(4)
+    time.sleep(15)
     data = fetch_rem_endpoint("tasa_interes")
     if data and "datos" in data:
         for row in data["datos"]:
@@ -1180,7 +1328,7 @@ def fetch_rem_api():
             if "próx. 12 meses" in ref or "prox. 12 meses" in ref:
                 out["tasa_12m"] = row.get("mediana")
 
-    time.sleep(4)
+    time.sleep(15)
     data = fetch_rem_endpoint("pbi")
     if data and "datos" in data:
         datos = data["datos"]
@@ -1526,7 +1674,6 @@ valor_real_1m = {
     "BTC": rend_valor_real("BTC", False, 1),
     "Oro": rend_valor_real("Oro", False, 1),
     "Plazo Fijo 30d": tasa_a_retorno_real_usd(tasa_plazo_fijo, 1, bench_1m),
-    "BADLAR": tasa_a_retorno_real_usd(tasa_badlar, 1, bench_1m),
     "Dólares quietos": 0.0,
 }
 
@@ -1537,47 +1684,12 @@ valor_real_1a = {
     "BTC": rend_valor_real("BTC", False, 12),
     "Oro": rend_valor_real("Oro", False, 12),
     "Plazo Fijo 30d": tasa_a_retorno_real_usd(tasa_plazo_fijo, 12, bench_1a),
-    "BADLAR": tasa_a_retorno_real_usd(tasa_badlar, 12, bench_1a),
     "Dólares quietos": 0.0,
 }
 
-
-def costo_fin_usd(tna, meses, bench):
-    if tna is None or bench is None:
-        return None
-    try:
-        rend = tna_a_retorno_periodo(tna, meses) / 100
-        df_of = macro_dfs["oficial"]
-        dev = 0
-        if not df_of.empty:
-            usd_hoy = float(df_of["USD_Oficial"].iloc[-1])
-            tgt = HOY - timedelta(days=30 * meses)
-            rows = df_of[df_of["fecha"] <= tgt]
-            if not rows.empty:
-                usd_ant = float(rows["USD_Oficial"].iloc[-1])
-                dev = (usd_hoy / usd_ant) - 1
-        if (1 + dev) == 0:
-            return None
-        return round(((1 + rend) / (1 + dev) - 1) * 100, 2)
-    except Exception:
-        return None
-
-
-financiamiento_1m = {
-    "Adelanto Cta Cte": costo_fin_usd(tasas_fin["adelanto_cta_cte"], 1, bench_1m),
-    "Tarjeta crédito": costo_fin_usd(tasas_fin["tarjeta_credito"], 1, bench_1m),
-    "Préstamo Personal": costo_fin_usd(tasas_fin["prestamo_personal"], 1, bench_1m),
-    "Hipotecario UVA": costo_fin_usd(tasas_fin["hipotecario_uva"], 1, bench_1m),
-    "Cheques SGR descuento": costo_fin_usd(tasas_fin["sgr_cheque"], 1, bench_1m),
-}
-
-financiamiento_1a = {
-    "Adelanto Cta Cte": costo_fin_usd(tasas_fin["adelanto_cta_cte"], 12, bench_1a),
-    "Tarjeta crédito": costo_fin_usd(tasas_fin["tarjeta_credito"], 12, bench_1a),
-    "Préstamo Personal": costo_fin_usd(tasas_fin["prestamo_personal"], 12, bench_1a),
-    "Hipotecario UVA": costo_fin_usd(tasas_fin["hipotecario_uva"], 12, bench_1a),
-    "Cheques SGR descuento": costo_fin_usd(tasas_fin["sgr_cheque"], 12, bench_1a),
-}
+# Financiamiento: vacío porque las tasas eran heurísticas
+financiamiento_1m = {}
+financiamiento_1a = {}
 
 
 # ---------------------------------------------------------------
@@ -1882,12 +1994,9 @@ def parsear_json(texto):
 
 
 # Llamadas LLM (6 total)
-print("\n  → Llamada 1: resumen (Gemini Pro, más robusto)...")
-# Primero intentamos Pro (más confiable), si falla caemos a Flash
-resp_resumen_txt = llamar_gemini(build_prompt_resumen(), intentos=2, model=GEMINI_MODEL_PRO)
-if not resp_resumen_txt:
-    print("  → Fallback a Flash...")
-    resp_resumen_txt = llamar_gemini(build_prompt_resumen(), intentos=2, model=GEMINI_MODEL_FLASH)
+print("\n  → Llamada 1: resumen...")
+# Solo Flash (el Pro tiene 25 req/día free, causaba quota exceeded)
+resp_resumen_txt = llamar_gemini(build_prompt_resumen(), intentos=3, model=GEMINI_MODEL_FLASH)
 
 resp_resumen = parsear_json(resp_resumen_txt) or {
     "mundo": "Análisis en procesamiento",
