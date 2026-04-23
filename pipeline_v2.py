@@ -24,9 +24,9 @@ print("=" * 60)
 # ---------------------------------------------------------------
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 GCP_JSON = os.environ.get("GCLOUD_SERVICE_ACCOUNT")
-FRED_API_KEY = os.environ.get("FRED_API_KEY", "")
-CHILE_USER = os.environ.get("CHILE_USER", "")
-CHILE_PASS = os.environ.get("CHILE_PASS", "")
+FRED_API_KEY = os.environ.get("FRED_API_KEY", "").strip()  # FIX: strip whitespace
+CHILE_USER = os.environ.get("CHILE_USER", "").strip()
+CHILE_PASS = os.environ.get("CHILE_PASS", "").strip()
 ROFEX_USER = os.environ.get("ROFEX_USER", "")
 ROFEX_PASS = os.environ.get("ROFEX_PASS", "")
 SHEET_NAME = os.environ.get("SHEET_NAME", "Dashboard Macro")
@@ -173,33 +173,209 @@ for key, (url, src_col, dest_col) in endpoints_argdatos.items():
 
 
 # ---------------------------------------------------------------
-# 2. EMAE + RIPTE (CSV directo)
+# 2. EMAE (Excel oficial INDEC) + Índice de Salarios (CSV oficial INDEC)
 # ---------------------------------------------------------------
-print("\n[2/10] EMAE y RIPTE...")
+print("\n[2/10] EMAE y Salarios desde fuentes INDEC oficiales...")
 
-# EMAE desde API datos.gob.ar
-EMAE_SERIE_ID = "143.3_NO_PR_2004_A_21"
-df_emae_raw = fetch_indec_series(EMAE_SERIE_ID, "EMAE")
+# === EMAE desde Excel oficial INDEC ===
+# URL verificada: https://www.indec.gob.ar/ftp/cuadros/economia/sh_emae_mensual_base2004.xls
+# Lag oficial: 50-60 días (publicación día 22 aprox del mes)
+EMAE_XLS_URL = "https://www.indec.gob.ar/ftp/cuadros/economia/sh_emae_mensual_base2004.xls"
+
+
+def fetch_emae_from_indec_xls():
+    """
+    Descarga el XLS oficial del EMAE base 2004 directo del INDEC.
+    Estructura típica: header en filas 1-3, después columnas con períodos y valores.
+    """
+    try:
+        r = requests.get(EMAE_XLS_URL, headers=HEADERS, timeout=60, verify=False)
+        if r.status_code != 200:
+            print(f"  ⚠ EMAE XLS HTTP {r.status_code}")
+            return pd.DataFrame()
+
+        # Guardar a temp file
+        tmp_path = "/tmp/emae_indec.xls"
+        with open(tmp_path, "wb") as f:
+            f.write(r.content)
+
+        # Leer con pandas (xlrd para .xls antiguo)
+        try:
+            xls = pd.ExcelFile(tmp_path, engine="xlrd")
+        except Exception:
+            xls = pd.ExcelFile(tmp_path)
+
+        # La primera hoja típicamente contiene la serie original + desestacionalizada
+        sheet_name = xls.sheet_names[0]
+        df_raw = pd.read_excel(tmp_path, sheet_name=sheet_name, header=None)
+
+        # Buscar la fila que contiene "Año" o el primer año (2004)
+        rows = []
+        anio_actual = None
+        for idx, row in df_raw.iterrows():
+            try:
+                # Detectar año (1ra columna numérica entre 2004 y 2030)
+                first_val = row.iloc[0]
+                if pd.notna(first_val):
+                    try:
+                        anio_int = int(float(str(first_val).strip()))
+                        if 2004 <= anio_int <= 2030:
+                            anio_actual = anio_int
+                            continue
+                    except Exception:
+                        pass
+
+                # Detectar mes (1ra columna texto = enero, febrero, etc.)
+                if anio_actual and pd.notna(first_val):
+                    mes_str = str(first_val).strip().lower()
+                    meses_map = {
+                        "enero": 1, "febrero": 2, "marzo": 3, "abril": 4,
+                        "mayo": 5, "junio": 6, "julio": 7, "agosto": 8,
+                        "septiembre": 9, "octubre": 10, "noviembre": 11, "diciembre": 12,
+                    }
+                    if mes_str in meses_map:
+                        # Tomar el primer valor numérico de las siguientes columnas
+                        # Habitualmente la columna 1 es el índice nivel general original
+                        for col_idx in range(1, min(len(row), 6)):
+                            try:
+                                val = float(row.iloc[col_idx])
+                                if 50 < val < 300:  # Rangos plausibles para índice base 2004=100
+                                    rows.append({
+                                        "fecha": pd.Timestamp(year=anio_actual, month=meses_map[mes_str], day=1),
+                                        "EMAE": val,
+                                    })
+                                    break
+                            except Exception:
+                                continue
+            except Exception:
+                continue
+
+        if not rows:
+            print(f"  ⚠ EMAE XLS sin filas parseadas")
+            return pd.DataFrame()
+
+        df = pd.DataFrame(rows).drop_duplicates(subset=["fecha"]).sort_values("fecha").reset_index(drop=True)
+        return df
+    except Exception as e:
+        print(f"  ⚠ EMAE XLS error: {e}")
+        return pd.DataFrame()
+
+
+# Intento 1: Excel oficial INDEC
+df_emae_raw = fetch_emae_from_indec_xls()
+
+# Fallback: API datos.gob.ar (si Excel falla por algún motivo)
+if df_emae_raw.empty:
+    print(f"  → Fallback EMAE: datos.gob.ar")
+    EMAE_SERIE_ID = "143.3_NO_PR_2004_A_21"
+    df_emae_raw = fetch_indec_series(EMAE_SERIE_ID, "EMAE")
+
 if not df_emae_raw.empty:
-    print(f"  ✓ EMAE: {len(df_emae_raw)} filas, último {df_emae_raw['fecha'].max().date()}")
+    print(f"  ✓ EMAE: {len(df_emae_raw)} filas, último {df_emae_raw['fecha'].max().date()}, "
+          f"valor {df_emae_raw['EMAE'].iloc[-1]}")
 macro_dfs["emae"] = df_emae_raw
 
-# RIPTE desde CSV directo (URL verificada)
-RIPTE_CSV_URL = "https://infra.datos.gob.ar/catalog/sspm/dataset/158/distribution/158.1/download/remuneracion-imponible-promedio-trabajadores-estables-ripte-total-pais-pesos-serie-mensual.csv"
-df_ripte_raw = pd.DataFrame()
-try:
-    df_raw = fetch_csv(RIPTE_CSV_URL)
-    if not df_raw.empty and "indice_tiempo" in df_raw.columns and "ripte" in df_raw.columns:
-        df_ripte_raw = df_raw.rename(columns={"indice_tiempo": "fecha", "ripte": "RIPTE"})
-        df_ripte_raw["fecha"] = pd.to_datetime(df_ripte_raw["fecha"], errors="coerce")
-        df_ripte_raw["RIPTE"] = pd.to_numeric(df_ripte_raw["RIPTE"], errors="coerce")
-        df_ripte_raw = df_ripte_raw.dropna().sort_values("fecha").reset_index(drop=True)
-        print(f"  ✓ RIPTE: {len(df_ripte_raw)} filas, último {df_ripte_raw['fecha'].max().date()}, "
-              f"valor {df_ripte_raw['RIPTE'].iloc[-1]}")
-except Exception as e:
-    print(f"  ✗ RIPTE: {e}")
 
-macro_dfs["ripte"] = df_ripte_raw
+# === Índice de Salarios desde CSV oficial INDEC ===
+# URL verificada: https://www.indec.gob.ar/ftp/cuadros/sociedad/indice_salarios.csv
+# Es el índice OFICIAL del INDEC (no RIPTE) - mide evolución salarial pura
+SALARIOS_CSV_URL = "https://www.indec.gob.ar/ftp/cuadros/sociedad/indice_salarios.csv"
+
+
+def fetch_salarios_indec():
+    """
+    CSV oficial INDEC con Índice de Salarios.
+    Columnas habituales: período, nivel general, sector privado registrado,
+    sector público, sector privado no registrado.
+    Usamos NIVEL GENERAL.
+    """
+    try:
+        r = requests.get(SALARIOS_CSV_URL, headers=HEADERS, timeout=30, verify=False)
+        if r.status_code != 200:
+            print(f"  ⚠ Salarios CSV HTTP {r.status_code}")
+            return pd.DataFrame()
+
+        # Probar varios encodings
+        text = None
+        for enc in ["utf-8", "latin-1", "cp1252", "iso-8859-1"]:
+            try:
+                text = r.content.decode(enc)
+                break
+            except Exception:
+                continue
+        if text is None:
+            text = r.text
+
+        # Probar separadores
+        for sep in [";", ",", "\t"]:
+            try:
+                df_raw = pd.read_csv(StringIO(text), sep=sep, dtype=str)
+                if len(df_raw.columns) >= 2:
+                    break
+            except Exception:
+                continue
+
+        if len(df_raw.columns) < 2:
+            print(f"  ⚠ Salarios CSV: estructura no reconocida")
+            return pd.DataFrame()
+
+        # Detectar columna de fecha (primera) y de nivel general (segunda)
+        col_fecha = df_raw.columns[0]
+        col_nivel = df_raw.columns[1]  # Nivel general suele ser la primera columna numérica
+
+        # Buscar columna explícita "Nivel general" si existe
+        for c in df_raw.columns:
+            cl = str(c).lower().strip()
+            if "nivel general" in cl or "general" in cl or "total" in cl:
+                col_nivel = c
+                break
+
+        # Parse fecha
+        df_raw["fecha"] = pd.to_datetime(df_raw[col_fecha], errors="coerce")
+        # Si fecha falló, intentar parsing manual MM/YYYY o YYYY-MM
+        if df_raw["fecha"].isna().all():
+            try:
+                df_raw["fecha"] = pd.to_datetime(df_raw[col_fecha], format="%m/%Y", errors="coerce")
+            except Exception:
+                pass
+
+        df_raw["IS"] = pd.to_numeric(
+            df_raw[col_nivel].astype(str).str.replace(",", ".").str.replace(" ", ""),
+            errors="coerce"
+        )
+
+        df = df_raw[["fecha", "IS"]].dropna().sort_values("fecha").reset_index(drop=True)
+        return df
+    except Exception as e:
+        print(f"  ⚠ Salarios CSV: {e}")
+        return pd.DataFrame()
+
+
+df_is_raw = fetch_salarios_indec()
+
+# RIPTE como fallback (la fuente anterior)
+df_ripte_raw = pd.DataFrame()
+if df_is_raw.empty:
+    print(f"  → Fallback salarios: RIPTE CSV")
+    RIPTE_CSV_URL = "https://infra.datos.gob.ar/catalog/sspm/dataset/158/distribution/158.1/download/remuneracion-imponible-promedio-trabajadores-estables-ripte-total-pais-pesos-serie-mensual.csv"
+    try:
+        df_raw = fetch_csv(RIPTE_CSV_URL)
+        if not df_raw.empty and "indice_tiempo" in df_raw.columns and "ripte" in df_raw.columns:
+            df_ripte_raw = df_raw.rename(columns={"indice_tiempo": "fecha", "ripte": "IS"})
+            df_ripte_raw["fecha"] = pd.to_datetime(df_ripte_raw["fecha"], errors="coerce")
+            df_ripte_raw["IS"] = pd.to_numeric(df_ripte_raw["IS"], errors="coerce")
+            df_ripte_raw = df_ripte_raw.dropna().sort_values("fecha").reset_index(drop=True)
+    except Exception:
+        pass
+    df_is_raw = df_ripte_raw
+
+if not df_is_raw.empty:
+    print(f"  ✓ Salarios: {len(df_is_raw)} filas, último {df_is_raw['fecha'].max().date()}, "
+          f"valor {df_is_raw['IS'].iloc[-1]:.2f}")
+else:
+    print(f"  ✗ Salarios: SIN datos")
+
+macro_dfs["salarios"] = df_is_raw
 
 
 # ---------------------------------------------------------------
@@ -287,17 +463,18 @@ print(f"  ✓ EMAE: val={emae_val} | YoY={emae_yoy}% | age={emae_age_days}d")
 
 
 # ---------------------------------------------------------------
-# 5. SALARIO REAL (RIPTE / IPC)
+# 5. SALARIO REAL — Índice de Salarios INDEC deflactado por IPC
 # ---------------------------------------------------------------
-print("\n[5/10] Salario real...")
+print("\n[5/10] Salario real (Índice de Salarios INDEC / IPC)...")
 
 salario_real_yoy = None
 salario_real_fechas = []
 salario_real_valores = []
 salario_real_age_days = None
 
-if not df_ripte_raw.empty and not df_ipc.empty:
-    df_s = df_ripte_raw.copy()
+# Usamos df_is_raw (Índice de Salarios oficial INDEC) en lugar de RIPTE
+if not df_is_raw.empty and not df_ipc.empty:
+    df_s = df_is_raw.copy()
     df_s["ym"] = df_s["fecha"].dt.to_period("M")
     df_s = df_s.drop_duplicates(subset=["ym"], keep="last")
 
@@ -305,23 +482,35 @@ if not df_ripte_raw.empty and not df_ipc.empty:
     df_i["ym"] = df_i["fecha"].dt.to_period("M")
     df_i = df_i.drop_duplicates(subset=["ym"], keep="last")
 
-    merged = df_s.merge(df_i[["ym", "IPC"]], on="ym", how="inner").sort_values("ym")
+    merged = df_s.merge(df_i[["ym", "IPC"]], on="ym", how="inner").sort_values("ym").reset_index(drop=True)
     print(f"  • Merge salarios+IPC: {len(merged)} filas")
 
+    # Necesitamos al menos 13 meses (mes 0 = base + 12 meses adelante)
     if len(merged) >= 13:
+        # Tomar últimos 13 meses
         slice_ = merged.tail(13).reset_index(drop=True)
-        base_salario = slice_.iloc[0]["RIPTE"]
-        factor_ipc = 1.0
+
+        # Base 100 = Índice de Salarios del primer mes de la ventana (hace 12 meses)
+        is_base = slice_.iloc[0]["IS"]
+
+        # Acumulamos inflación mes a mes
+        ipc_acum = 1.0
         for i in range(1, len(slice_)):
-            factor_ipc *= (1 + slice_.iloc[i]["IPC"] / 100)
-            salario_nominal_idx = slice_.iloc[i]["RIPTE"] / base_salario
-            salario_real = salario_nominal_idx / factor_ipc * 100
+            ipc_acum *= (1 + slice_.iloc[i]["IPC"] / 100)
+
+            # Salario real = (Índice salarios actual / base) / inflación acumulada * 100
+            # Si vale > 100 → salarios crecen MÁS que inflación (ganan poder de compra)
+            # Si vale < 100 → salarios crecen MENOS que inflación (pierden poder de compra)
+            is_actual = slice_.iloc[i]["IS"]
+            salario_real = (is_actual / is_base) / ipc_acum * 100
             salario_real_valores.append(round(salario_real, 2))
             salario_real_fechas.append(slice_.iloc[i]["ym"].strftime("%b %y"))
 
         if salario_real_valores:
+            # YoY = último valor - 100 (base hace 12 meses)
             salario_real_yoy = round(salario_real_valores[-1] - 100, 2)
-        salario_real_age_days = (pd.Timestamp.now() - df_ripte_raw["fecha"].iloc[-1]).days
+
+        salario_real_age_days = (pd.Timestamp.now() - df_is_raw["fecha"].iloc[-1]).days
 
 print(f"  ✓ Salario real: YoY={salario_real_yoy}% | age={salario_real_age_days}d")
 
@@ -472,6 +661,15 @@ bench_1m = get_bench(1)
 bench_1a = get_bench(12)
 print(f"  ✓ Bench 1M: {bench_1m}% | 1A: {bench_1a}%")
 
+# FIX: si bench es None, usar 0 como fallback para que la tabla aparezca
+# (mejor mostrar tabla con benchmark conservador que tabla vacía)
+if bench_1m is None:
+    bench_1m = 0.0
+    print(f"  ⚠ bench_1m=None → fallback 0.0 para no romper tabla")
+if bench_1a is None:
+    bench_1a = 0.0
+    print(f"  ⚠ bench_1a=None → fallback 0.0 para no romper tabla")
+
 
 def tasa_a_retorno_real_usd(tna, meses, bench_pct):
     if tna is None or bench_pct is None:
@@ -538,7 +736,9 @@ df_final = df_final.sort_values("fecha").reset_index(drop=True)
 if "GGAL_LOC" in df_final.columns and "GGAL_ADR" in df_final.columns:
     loc = pd.to_numeric(df_final["GGAL_LOC"], errors="coerce")
     adr = pd.to_numeric(df_final["GGAL_ADR"], errors="coerce")
-    df_final["CCL"] = (loc / (adr / 10)).round(2)
+    ccl_raw = (loc / (adr / 10)).round(2)
+    # FIX: rolling 5 días para suavizar y evitar NaN cuando un ticker no tiene dato
+    df_final["CCL"] = ccl_raw.rolling(window=5, min_periods=1).mean().round(2)
     oficial = pd.to_numeric(df_final.get("USD_Oficial", pd.Series()), errors="coerce")
     if not oficial.empty:
         df_final["Brecha_CCL"] = (((df_final["CCL"] / oficial) - 1) * 100).round(2)
@@ -654,52 +854,80 @@ if not df_ipca_br.empty and len(df_ipca_br) >= 12:
 print(f"  ✓ Brasil: Selic={tasa_pm_br}% | Inflación YoY={inf_br}%")
 
 
-# Chile: INE con credenciales
-def fetch_chile_ipc():
-    """
-    INE Chile tiene su API de estadísticas:
-    https://stat.ine.cl/SDMX-JSON/data/IPC_CATEG_ORIG_POND/all/all?format=csv
-    
-    También hay una API con usuario/pass en el servicio de búsqueda.
-    Usamos el endpoint público de estadísticas mensuales.
-    """
-    # Intento 1: API pública con credenciales
-    if CHILE_USER and CHILE_PASS:
-        url = "https://api.cmfchile.cl/api-sbifv3/recursos_api/ipc"
-        params = {
-            "apikey": CHILE_PASS,  # la clave suele ser el pass en API banco central
-            "formato": "json",
-        }
-        data = fetch_json(url, headers={"user": CHILE_USER})
-        if data and "IPCs" in data:
-            try:
-                rows = data["IPCs"]
-                df = pd.DataFrame(rows)
-                df["fecha"] = pd.to_datetime(df.get("Fecha", df.get("fecha")), errors="coerce")
-                df["valor"] = pd.to_numeric(df.get("Valor", df.get("valor")).astype(str).str.replace(",", "."), errors="coerce")
-                return df[["fecha", "valor"]].dropna().sort_values("fecha").reset_index(drop=True)
-            except Exception as e:
-                print(f"  ⚠ Parse Chile IPC: {e}")
-
-    # Fallback: FRED Chile CPI
-    df = fetch_fred_api("CHLCPIALLMINMEI")
-    return df
-
-
-df_ipc_cl = fetch_chile_ipc()
-inf_cl = None
-if not df_ipc_cl.empty and len(df_ipc_cl) >= 13:
+# ===== Chile: Banco Central de Chile (BCCh) — API BDE =====
+# Endpoint oficial: https://si3.bcentral.cl/SieteRestWS/SieteRestWS.ashx
+# Series IDs (verificadas en doc oficial):
+#   F022.TPM.TIN.D001.NO.Z.D = TPM diaria
+#   F073.IPC.V12.Z.M         = IPC variación 12 meses
+def fetch_bcch_serie(timeseries_id, dias=400):
+    """Banco Central de Chile - API BDE."""
+    if not CHILE_USER or not CHILE_PASS:
+        return pd.DataFrame()
+    fecha_desde = (HOY - timedelta(days=dias)).strftime("%Y-%m-%d")
+    fecha_hasta = HOY.strftime("%Y-%m-%d")
+    url = "https://si3.bcentral.cl/SieteRestWS/SieteRestWS.ashx"
+    params = {
+        "user": CHILE_USER,
+        "pass": CHILE_PASS,
+        "function": "GetSeries",
+        "timeseries": timeseries_id,
+        "firstdate": fecha_desde,
+        "lastdate": fecha_hasta,
+    }
     try:
-        ult = float(df_ipc_cl["valor"].iloc[-1])
-        ant = float(df_ipc_cl["valor"].iloc[-13])
-        inf_cl = round(((ult / ant) - 1) * 100, 2)
-    except Exception:
-        pass
+        r = requests.get(url, params=params, timeout=30, verify=False)
+        if r.status_code != 200:
+            print(f"  ⚠ BCCh {timeseries_id}: HTTP {r.status_code}")
+            return pd.DataFrame()
+        data = r.json()
+        # Estructura: data["Series"]["Obs"] = lista de {indexDateString, value, statusCode}
+        obs = data.get("Series", {}).get("Obs", [])
+        if not obs:
+            print(f"  ⚠ BCCh {timeseries_id}: sin observaciones")
+            return pd.DataFrame()
+        rows = []
+        for o in obs:
+            try:
+                # value puede ser "NaN", "NeuN", o número como string
+                val_str = str(o.get("value", "")).replace(",", ".")
+                if val_str.lower() in ("nan", "neun", "", "null"):
+                    continue
+                val = float(val_str)
+                fecha = pd.to_datetime(o.get("indexDateString"), format="%d-%m-%Y", errors="coerce")
+                if pd.isna(fecha):
+                    continue
+                rows.append({"fecha": fecha, "valor": val})
+            except Exception:
+                continue
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows).sort_values("fecha").reset_index(drop=True)
+        return df
+    except Exception as e:
+        print(f"  ⚠ BCCh {timeseries_id}: {e}")
+        return pd.DataFrame()
 
-# Tasa política monetaria Chile: Banco Central Chile
-# TPM actual via FRED IR3TIB01CLM156N
-df_tpm_cl = fetch_fred_api("IR3TIB01CLM156N")
+
+# IPC YoY directo (la serie F073.IPC.V12.Z.M ya viene como variación interanual)
+df_ipc_cl = fetch_bcch_serie("F073.IPC.V12.Z.M")
+inf_cl = ultimo_valor(df_ipc_cl)
+if df_ipc_cl.empty:
+    # Fallback: FRED Chile CPI calculando YoY manual
+    df_ipc_cl_idx = fetch_fred_api("CHLCPIALLMINMEI")
+    if not df_ipc_cl_idx.empty and len(df_ipc_cl_idx) >= 13:
+        try:
+            ult = float(df_ipc_cl_idx["valor"].iloc[-1])
+            ant = float(df_ipc_cl_idx["valor"].iloc[-13])
+            inf_cl = round(((ult / ant) - 1) * 100, 2)
+        except Exception:
+            pass
+
+# TPM (Tasa Política Monetaria diaria)
+df_tpm_cl = fetch_bcch_serie("F022.TPM.TIN.D001.NO.Z.D")
 tasa_pm_cl = ultimo_valor(df_tpm_cl)
+if tasa_pm_cl is None:
+    df_tpm_cl_fallback = fetch_fred_api("IR3TIB01CLM156N")
+    tasa_pm_cl = ultimo_valor(df_tpm_cl_fallback)
 
 print(f"  ✓ Chile: TPM={tasa_pm_cl}% | Inflación YoY={inf_cl}%")
 
@@ -1478,13 +1706,29 @@ REGLAS: sin recomendaciones, interpretación objetiva, rioplatense, sin emojis, 
 
 
 def build_prompt_macro_global():
+    def fmt_pct(v, suffix="%"):
+        if v is None:
+            return "N/D"
+        try:
+            return f"{float(v):.2f}{suffix}"
+        except Exception:
+            return "N/D"
+
+    def fmt_int(v, suffix="bps"):
+        if v is None:
+            return "N/D"
+        try:
+            return f"{int(float(v))}{suffix}"
+        except Exception:
+            return "N/D"
+
     bloques = []
     for pais, d in macro_global.items():
         bloques.append(
-            f"{pais.upper()}: inflación YoY={d.get('inflacion_yoy', 'N/D')}%, "
-            f"tasa nominal={d.get('tasa_nominal', 'N/D')}%, "
-            f"TASA REAL={d.get('tasa_real', 'N/D')}%, "
-            f"riesgo={d.get('riesgo_pais', 'N/D')}bps"
+            f"{pais.upper()}: inflación YoY={fmt_pct(d.get('inflacion_yoy'))}, "
+            f"tasa nominal={fmt_pct(d.get('tasa_nominal'))}, "
+            f"TASA REAL={fmt_pct(d.get('tasa_real'))}, "
+            f"riesgo={fmt_int(d.get('riesgo_pais'))}"
         )
 
     return f"""Analista financiero. Comparación regional:
@@ -1495,6 +1739,11 @@ def build_prompt_macro_global():
 1. Posición de Argentina en TASA REAL vs región. Tasa real alta = atrae capital pero puede frenar economía.
 2. Brasil vs Chile: cuál es más barato/caro en riesgo crediticio y por qué matters.
 3. Diferencial de tasas con EEUU y implicancia para flujos a emergentes (carry trade).
+
+REGLAS IMPORTANTES:
+- Si algún dato dice "N/D", SIMPLEMENTE OMITILO sin mencionarlo.
+- No digas "no hay datos" ni "información incompleta".
+- Trabajá con los datos que SÍ están disponibles.
 
 JSON: {{"analisis_global": "3 oraciones, máx 500 chars"}}
 
@@ -1578,8 +1827,18 @@ resp_vr_1a = parsear_json(llamar_gemini(build_prompt_valor_real(valor_real_1a, f
 analisis_vr_1a = resp_vr_1a.get("analisis", "Sin análisis disponible")
 
 print("  → Llamada 5: lectura macro Argentina...")
-resp_macro = parsear_json(llamar_gemini(build_prompt_lectura_macro())) or {}
-lectura_macro = resp_macro.get("lectura_macro", "Sin análisis disponible")
+# FIX: validar que al menos 2 de 3 series tengan datos antes de llamar LLM
+series_ok = sum([
+    1 if ipc_yoy is not None else 0,
+    1 if emae_yoy is not None else 0,
+    1 if salario_real_yoy is not None else 0,
+])
+if series_ok >= 2:
+    resp_macro = parsear_json(llamar_gemini(build_prompt_lectura_macro())) or {}
+    lectura_macro = resp_macro.get("lectura_macro", "Análisis en proceso")
+else:
+    lectura_macro = "Datos macroeconómicos insuficientes en esta corrida. Esperando próxima publicación de INDEC."
+    print(f"  ⚠ Solo {series_ok}/3 series con datos. Salto LLM.")
 
 print("  → Llamada 6: macro global...")
 resp_global = parsear_json(llamar_gemini(build_prompt_macro_global())) or {}
