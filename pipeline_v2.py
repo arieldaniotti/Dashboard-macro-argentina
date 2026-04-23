@@ -911,16 +911,16 @@ tickers = {
     "BTC": "BTC-USD",
     "Oro": "GC=F",
     "Brent": "BZ=F",
-    # AL30D.BA eliminado: Yahoo no lo indexa y colgaba yf.download hasta 15 min.
-    # Se intenta AL30.BA (pesos) como best-effort; si falla, el dashboard muestra
-    # la tarjeta AL30 sin datos y el pipeline sigue.
-    "AL30": "AL30.BA",
+    # AL30 ELIMINADO de yfinance: Yahoo no indexa bien los bonos argentinos
+    # y colgaba yf.download hasta 15min por reintentos internos (SIGALRM no
+    # interrumpe llamadas C de curl_cffi). Ahora AL30 viene de data912.com
+    # más abajo, con timeout real de requests.
     "GGAL_ADR": "GGAL",
     "GGAL_LOC": "GGAL.BA",
     "US10Y": "^TNX",
 }
 
-# FIX: timeout duro de 30s por ticker para que yfinance no cuelgue el pipeline
+# Timeout duro por ticker para yfinance (defensa extra por si Yahoo se pone raro)
 TIMEOUT_YF_SEG = 30
 
 
@@ -950,6 +950,57 @@ for col, tk in tickers.items():
     except Exception as e:
         print(f"  ✗ {col} ({tk}): {str(e)[:120]}")
 
+
+# ---------------------------------------------------------------
+# AL30 desde data912.com (API pública sin auth)
+# Endpoint: https://data912.com/live/arg_bonds devuelve JSON con symbol, c (close), px_ask, px_bid
+# ---------------------------------------------------------------
+def fetch_al30_data912():
+    """
+    Trae AL30 desde data912.com. API pública, sin auth.
+    Requests con timeout de 15s — si falla, el pipeline sigue.
+    Devuelve Series indexada por fecha con el precio actual replicado,
+    o None si falla. Nota: data912 es snapshot (no histórico).
+    """
+    try:
+        r = requests.get("https://data912.com/live/arg_bonds", headers=HEADERS, timeout=15)
+        if r.status_code != 200:
+            print(f"  ⚠ data912 arg_bonds: HTTP {r.status_code}")
+            return None
+        bonos = r.json()
+        if not isinstance(bonos, list):
+            print(f"  ⚠ data912: formato inesperado")
+            return None
+        # Buscar AL30 (símbolo puede ser "AL30" a secas o con sufijo)
+        al30_rec = None
+        for b in bonos:
+            sym = str(b.get("symbol", "")).upper()
+            if sym in ("AL30", "AL30D"):
+                al30_rec = b
+                break
+        if not al30_rec:
+            print(f"  ⚠ data912: AL30 no encontrado en {len(bonos)} bonos")
+            return None
+        # Campos típicos: c (close), px_bid, px_ask
+        precio = al30_rec.get("c") or al30_rec.get("close") or al30_rec.get("last")
+        if precio is None:
+            # Fallback: promedio bid/ask
+            bid = al30_rec.get("px_bid") or al30_rec.get("bid")
+            ask = al30_rec.get("px_ask") or al30_rec.get("ask")
+            if bid and ask:
+                precio = (float(bid) + float(ask)) / 2
+        if precio is None:
+            print(f"  ⚠ data912: AL30 sin precio")
+            return None
+        print(f"  ✓ AL30 (data912): ${float(precio):.2f}")
+        return float(precio)
+    except Exception as e:
+        print(f"  ⚠ data912: {str(e)[:120]}")
+        return None
+
+
+al30_precio_spot = fetch_al30_data912()
+
 if not df_m.empty:
     df_m = df_m.reset_index().rename(columns={"Date": "fecha"})
     df_m["fecha"] = pd.to_datetime(df_m["fecha"]).dt.tz_localize(None)
@@ -973,6 +1024,18 @@ if "GGAL_LOC" in df_final.columns and "GGAL_ADR" in df_final.columns:
         df_final["Brecha_CCL"] = (((df_final["CCL"] / oficial) - 1) * 100).round(2)
 
 df_final = df_final.ffill(limit=7)
+
+# Inyectar AL30 spot de data912.com en la última fila de df_final.
+# data912 es snapshot (no histórico), entonces solo tendrá valor la última fila.
+# Esto hace que snapshot_ratio("AL30") devuelva val (sin d1/m1/a1) y que
+# rend_valor_real devuelva None — ambos comportamientos limpios para el dashboard.
+if al30_precio_spot is not None and not df_final.empty:
+    df_final["AL30"] = pd.NA
+    df_final.loc[df_final.index[-1], "AL30"] = al30_precio_spot
+    print(f"  ✓ AL30 inyectado en última fila: ${al30_precio_spot:.2f}")
+else:
+    print(f"  ⚠ AL30 sin datos en esta corrida")
+
 print(f"  ✓ df_final: {len(df_final)} filas")
 
 
