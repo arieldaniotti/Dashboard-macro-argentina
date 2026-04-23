@@ -475,7 +475,8 @@ def render_salario_real_card():
         delta_text = "Sin variación real"
         delta_color = "#94a3b8"
 
-    subtexto = "Variación interanual (RIPTE deflactado)"
+    # Subtítulo explicativo de metodología
+    subtexto = "Índice Salarios INDEC deflactado por IPC (12m)"
 
     macro_card_integrated(
         "Salario real",
@@ -793,8 +794,14 @@ with tab3:
     with col_b: render_emae_card()
     with col_c: render_salario_real_card()
 
+    st.caption(
+        "💡 **Salario real**: base 100 = índice del mes hace 12 meses. "
+        "Valor >0% indica que los salarios crecieron más que la inflación acumulada. "
+        "Fuente: Índice de Salarios Nivel General (INDEC) deflactado por IPC."
+    )
+
     lectura = get_insight("lectura_macro", "")
-    if lectura:
+    if lectura and "insuficiente" not in lectura.lower():
         st.markdown(
             f'<div class="ai-box" style="margin-top:16px;">'
             f'<div style="color:#38bdf8;font-weight:bold;margin-bottom:8px;font-size:13px;">'
@@ -803,6 +810,9 @@ with tab3:
             f'</div>',
             unsafe_allow_html=True,
         )
+    elif lectura:
+        # Mensaje honesto cuando hay info pero LLM no aplica
+        st.info(f"ℹ️ {lectura}")
 
     st.markdown('<div class="section-title">🔍 ANÁLISIS DE VALOR REAL (BASE USD)</div>', unsafe_allow_html=True)
 
