@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import signal
 import requests
 import feedparser
 import yfinance as yf
@@ -15,9 +16,34 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 print("=" * 60)
-print("Pipeline V21 - Iniciando")
+print("Pipeline V22 - Iniciando")
 print(f"Fecha corrida: {datetime.now(timezone.utc).isoformat()}")
 print("=" * 60)
+
+
+# ---------------------------------------------------------------
+# TIMEOUT DURO (SIGALRM) - para funciones que se cuelgan
+# ---------------------------------------------------------------
+class _HardTimeout(Exception):
+    pass
+
+
+def _sigalrm_handler(signum, frame):
+    raise _HardTimeout("SIGALRM triggered")
+
+
+def run_with_timeout(seconds, func, *args, **kwargs):
+    """
+    Ejecuta func con timeout duro usando SIGALRM (Linux/macOS).
+    Devuelve el resultado, o lanza _HardTimeout si excede `seconds`.
+    """
+    old_handler = signal.signal(signal.SIGALRM, _sigalrm_handler)
+    signal.alarm(int(seconds))
+    try:
+        return func(*args, **kwargs)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
 
 # ---------------------------------------------------------------
 # CONFIG - SECRETS
@@ -885,23 +911,44 @@ tickers = {
     "BTC": "BTC-USD",
     "Oro": "GC=F",
     "Brent": "BZ=F",
-    "AL30": "AL30D.BA",  # FIX: AL30D es la versión USD-LIQ que sí está disponible
+    # AL30D.BA eliminado: Yahoo no lo indexa y colgaba yf.download hasta 15 min.
+    # Se intenta AL30.BA (pesos) como best-effort; si falla, el dashboard muestra
+    # la tarjeta AL30 sin datos y el pipeline sigue.
+    "AL30": "AL30.BA",
     "GGAL_ADR": "GGAL",
     "GGAL_LOC": "GGAL.BA",
     "US10Y": "^TNX",
 }
 
+# FIX: timeout duro de 30s por ticker para que yfinance no cuelgue el pipeline
+TIMEOUT_YF_SEG = 30
+
+
+def _descargar_ticker(tk):
+    """Wrapper para yf.download con threads=False (evita hilos zombie)."""
+    return yf.download(
+        tk,
+        start=HACE_1A.strftime("%Y-%m-%d"),
+        progress=False,
+        auto_adjust=True,
+        threads=False,
+    )
+
+
 df_m = pd.DataFrame()
 for col, tk in tickers.items():
+    t0 = time.time()
     try:
-        d = yf.download(tk, start=HACE_1A.strftime("%Y-%m-%d"), progress=False, auto_adjust=True)
-        if not d.empty:
+        d = run_with_timeout(TIMEOUT_YF_SEG, _descargar_ticker, tk)
+        if d is not None and not d.empty:
             df_m[col] = d["Close"]
-            print(f"  ✓ {col}: {len(d)} filas")
+            print(f"  ✓ {col} ({tk}): {len(d)} filas en {time.time()-t0:.1f}s")
         else:
-            print(f"  ✗ {col}: vacío")
+            print(f"  ✗ {col} ({tk}): vacío")
+    except _HardTimeout:
+        print(f"  ✗ {col} ({tk}): TIMEOUT {TIMEOUT_YF_SEG}s, salto")
     except Exception as e:
-        print(f"  ✗ {col}: {e}")
+        print(f"  ✗ {col} ({tk}): {str(e)[:120]}")
 
 if not df_m.empty:
     df_m = df_m.reset_index().rename(columns={"Date": "fecha"})
@@ -1206,13 +1253,82 @@ for pais, d in macro_global.items():
 print("\n[10/10] ROFEX + REM + noticias...")
 
 
+def fetch_rofex_rava():
+    """
+    Scraping de Rava (www.rava.com/cotizaciones/futuros).
+    Sin auth. Devuelve lista de {vencimiento, precio}.
+    Rava expone los futuros de dólar (DLR) en una tabla HTML dentro de
+    un JSON embebido en la página. Usamos un approach defensivo:
+    1) bajar HTML
+    2) buscar filas con patrón DLR/MMMYY y precio numérico
+    """
+    url = "https://www.rava.com/cotizaciones/futuros"
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=30)
+        if r.status_code != 200:
+            print(f"  ⚠ Rava futuros: HTTP {r.status_code}")
+            return []
+        html = r.text
+
+        # Rava mete los datos en un objeto JS. Buscamos bloques que parezcan futuros DLR.
+        # Patrón típico: "simbolo":"DLRNOV25" ... "ultimo":1234.56
+        import re
+        # Dos variantes del símbolo: DLR/NOV25 o DLRNOV25 (ambas aparecen)
+        pattern = re.compile(
+            r'"simbolo"\s*:\s*"(DLR/?[A-Z]{3}\d{2})"[^{}]*?"(?:ultimo|cierre|ajuste)"\s*:\s*([\d\.]+)',
+            re.IGNORECASE,
+        )
+        matches = pattern.findall(html)
+
+        futuros = []
+        vistos = set()
+        for sym, precio_str in matches:
+            # Normalizar símbolo: DLRNOV25 → DLR/NOV25
+            sym_clean = sym.upper().replace("DLR/", "DLR").replace("DLR", "DLR/", 1)
+            venc = sym_clean.replace("DLR/", "")
+            if venc in vistos:
+                continue
+            try:
+                precio = float(precio_str)
+                if precio <= 0:
+                    continue
+                vistos.add(venc)
+                futuros.append({"vencimiento": venc, "precio": precio})
+            except ValueError:
+                continue
+
+        if not futuros:
+            print(f"  ⚠ Rava futuros: HTML sin matches DLR (estructura cambió?)")
+            return []
+
+        # Ordenar por vencimiento cronológico (MMMAA → fecha)
+        meses_map = {
+            "ENE": 1, "FEB": 2, "MAR": 3, "ABR": 4, "MAY": 5, "JUN": 6,
+            "JUL": 7, "AGO": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DIC": 12,
+        }
+        def _venc_a_fecha(v):
+            try:
+                mes = meses_map.get(v[:3].upper(), 1)
+                anio = 2000 + int(v[3:5])
+                return datetime(anio, mes, 1)
+            except Exception:
+                return datetime(2099, 12, 31)
+
+        futuros.sort(key=lambda x: _venc_a_fecha(x["vencimiento"]))
+        print(f"  ✓ Rava futuros: {len(futuros)} contratos DLR")
+        return futuros
+
+    except Exception as e:
+        print(f"  ⚠ Rava futuros: {str(e)[:150]}")
+        return []
+
+
 def fetch_rofex_con_pyrofex():
     """
-    Usa pyRofex con credenciales de ReMarkets.
-    Requiere secrets ROFEX_USER y ROFEX_PASS.
+    Usa pyRofex con credenciales reales de Matba Rofex.
+    Requiere secrets ROFEX_USER y ROFEX_PASS (NO ReMarkets, que da data de testing).
     """
     if not ROFEX_USER or not ROFEX_PASS:
-        print(f"  • ROFEX: sin credenciales, salto")
         return []
 
     try:
@@ -1225,10 +1341,9 @@ def fetch_rofex_con_pyrofex():
             environment=pyRofex.Environment.LIVE,
         )
 
-        # Obtener instrumentos
         instruments = pyRofex.get_all_instruments()
         if not instruments or "instruments" not in instruments:
-            print(f"  ⚠ ROFEX: sin instrumentos")
+            print(f"  ⚠ pyRofex: sin instrumentos")
             return []
 
         futuros = []
@@ -1236,7 +1351,6 @@ def fetch_rofex_con_pyrofex():
             try:
                 instrument_id = ins.get("instrumentId", {})
                 symbol = instrument_id.get("symbol", "")
-                # Solo futuros de dólar (símbolos DLR/)
                 if not symbol.startswith("DLR/"):
                     continue
                 md = pyRofex.get_market_data(
@@ -1257,17 +1371,25 @@ def fetch_rofex_con_pyrofex():
             except Exception:
                 continue
 
-        print(f"  ✓ ROFEX: {len(futuros)} contratos")
+        print(f"  ✓ pyRofex: {len(futuros)} contratos")
         return sorted(futuros, key=lambda x: x["vencimiento"])
     except ImportError:
-        print(f"  ⚠ pyRofex no instalado, agregalo a requirements.txt")
+        print(f"  ⚠ pyRofex no instalado")
         return []
     except Exception as e:
-        print(f"  ⚠ ROFEX: {e}")
+        print(f"  ⚠ pyRofex: {str(e)[:150]}")
         return []
 
 
+# Orden de prioridad:
+# 1) pyRofex con credenciales reales (si existen)
+# 2) scraping de Rava (sin auth, datos de cierre públicos)
 rofex_futuros = fetch_rofex_con_pyrofex()
+if not rofex_futuros:
+    print(f"  • ROFEX: sin credenciales pyRofex, pruebo Rava...")
+    rofex_futuros = fetch_rofex_rava()
+if not rofex_futuros:
+    print(f"  ⚠ ROFEX: sin datos. Fallback a REM para expectativas de USD.")
 
 
 # REM via API de Facundo Allia (con retry para 429)
