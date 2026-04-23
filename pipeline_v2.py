@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import time
 import signal
@@ -15,9 +16,22 @@ from io import StringIO
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# FIX CRÍTICO: forzar stdout sin buffer para que los prints aparezcan en los logs
+# de GitHub Actions en tiempo real (aunque el proceso se cuelgue). Sin esto,
+# Python bufferea prints y no podemos diagnosticar dónde se cuelga.
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
+# También reemplazamos print() globalmente para que siempre flushee
+_orig_print = print
+def print(*args, **kwargs):
+    kwargs.setdefault("flush", True)
+    _orig_print(*args, **kwargs)
+
 print("=" * 60)
 print("Pipeline V22 - Iniciando")
 print(f"Fecha corrida: {datetime.now(timezone.utc).isoformat()}")
+print(f"Python version: {sys.version.split()[0]}")
 print("=" * 60)
 
 
