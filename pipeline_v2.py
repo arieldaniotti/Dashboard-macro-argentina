@@ -905,19 +905,32 @@ if not df_cpi_us.empty and len(df_cpi_us) >= 12:
 print(f"  ✓ EEUU: Fed={tasa_pm_us}% | Inflación YoY={inf_us}%")
 
 
-# Brasil: api.bcb.gov.br
-def fetch_bcb_brasil(serie_id, ultimos=15):
+# Brasil: api.bcb.gov.br - con retry para 502/503 transitorios
+def fetch_bcb_brasil(serie_id, ultimos=15, max_intentos=3):
     url = f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{serie_id}/dados/ultimos/{ultimos}?formato=json"
-    data = fetch_json(url)
-    if not data:
-        return pd.DataFrame()
-    try:
-        df = pd.DataFrame(data)
-        df["fecha"] = pd.to_datetime(df["data"], format="%d/%m/%Y", errors="coerce")
-        df["valor"] = pd.to_numeric(df["valor"], errors="coerce")
-        return df[["fecha", "valor"]].dropna().sort_values("fecha").reset_index(drop=True)
-    except Exception:
-        return pd.DataFrame()
+    for intento in range(max_intentos):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=30)
+            if r.status_code == 200:
+                data = r.json()
+                if not data:
+                    return pd.DataFrame()
+                df = pd.DataFrame(data)
+                df["fecha"] = pd.to_datetime(df["data"], format="%d/%m/%Y", errors="coerce")
+                df["valor"] = pd.to_numeric(df["valor"], errors="coerce")
+                return df[["fecha", "valor"]].dropna().sort_values("fecha").reset_index(drop=True)
+            if r.status_code in (502, 503, 504):
+                wait = (intento + 1) * 5
+                print(f"  • BCB {serie_id}: HTTP {r.status_code}, esperando {wait}s (intento {intento+1}/{max_intentos})")
+                time.sleep(wait)
+                continue
+            print(f"  ⚠ BCB {serie_id}: HTTP {r.status_code}")
+            return pd.DataFrame()
+        except Exception as e:
+            print(f"  ⚠ BCB {serie_id} intento {intento+1}: {str(e)[:100]}")
+            time.sleep(3)
+    print(f"  ✗ BCB {serie_id}: agotados intentos")
+    return pd.DataFrame()
 
 
 # BCB 433 = IPCA (var % mensual), 432 = Selic meta (% anual)
