@@ -31,6 +31,26 @@ ROFEX_USER = os.environ.get("ROFEX_USER", "")
 ROFEX_PASS = os.environ.get("ROFEX_PASS", "")
 SHEET_NAME = os.environ.get("SHEET_NAME", "Dashboard Macro")
 
+# DEBUG: diagnóstico de secrets (no imprime los valores, solo si están presentes y su longitud)
+print("\n--- DEBUG SECRETS ---")
+for name, value in [
+    ("GEMINI_API_KEY", GEMINI_API_KEY),
+    ("GCP_JSON", GCP_JSON),
+    ("FRED_API_KEY", FRED_API_KEY),
+    ("CHILE_USER", CHILE_USER),
+    ("CHILE_PASS", CHILE_PASS),
+    ("ROFEX_USER", ROFEX_USER),
+    ("ROFEX_PASS", ROFEX_PASS),
+    ("SHEET_NAME", SHEET_NAME),
+]:
+    if value:
+        # Mostrar longitud y primeros/últimos 2 caracteres. Nunca el valor completo.
+        v = str(value)
+        print(f"  {name}: ✓ presente | len={len(v)} | preview='{v[:2]}...{v[-2:]}'")
+    else:
+        print(f"  {name}: ✗ VACÍO o no seteado")
+print("--- FIN DEBUG ---\n")
+
 GEMINI_MODEL_FLASH = "gemini-2.5-flash"
 GEMINI_MODEL_PRO = "gemini-2.5-pro"  # Más robusto para el flash market que fallaba
 
