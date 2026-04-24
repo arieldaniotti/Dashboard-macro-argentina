@@ -1,5 +1,4 @@
 import os
-import sys
 import json
 import time
 import requests
@@ -15,24 +14,9 @@ from io import StringIO
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# FIX: forzar stdout unbuffered para que los prints aparezcan en tiempo real
-# en GitHub Actions. Sin esto, si el proceso se cuelga no vemos DÓNDE se clavó.
-try:
-    sys.stdout.reconfigure(line_buffering=True)
-    sys.stderr.reconfigure(line_buffering=True)
-except Exception:
-    pass
-
-# Wrapper de print que siempre flushea
-_orig_print = print
-def print(*args, **kwargs):
-    kwargs.setdefault("flush", True)
-    _orig_print(*args, **kwargs)
-
 print("=" * 60)
-print("Pipeline V22 - Iniciando")
+print("Pipeline V21 - Iniciando")
 print(f"Fecha corrida: {datetime.now(timezone.utc).isoformat()}")
-print(f"Python: {sys.version.split()[0]}")
 print("=" * 60)
 
 # ---------------------------------------------------------------
@@ -792,23 +776,15 @@ tickers = {
 
 df_m = pd.DataFrame()
 for col, tk in tickers.items():
-    t0 = time.time()
     try:
-        # threads=False evita hilos zombie si Yahoo no responde
-        d = yf.download(
-            tk,
-            start=HACE_1A.strftime("%Y-%m-%d"),
-            progress=False,
-            auto_adjust=True,
-            threads=False,
-        )
+        d = yf.download(tk, start=HACE_1A.strftime("%Y-%m-%d"), progress=False, auto_adjust=True)
         if not d.empty:
             df_m[col] = d["Close"]
-            print(f"  ✓ {col}: {len(d)} filas ({time.time()-t0:.1f}s)")
+            print(f"  ✓ {col}: {len(d)} filas")
         else:
-            print(f"  ✗ {col}: vacío ({time.time()-t0:.1f}s)")
+            print(f"  ✗ {col}: vacío")
     except Exception as e:
-        print(f"  ✗ {col}: {str(e)[:120]} ({time.time()-t0:.1f}s)")
+        print(f"  ✗ {col}: {e}")
 
 if not df_m.empty:
     df_m = df_m.reset_index().rename(columns={"Date": "fecha"})
