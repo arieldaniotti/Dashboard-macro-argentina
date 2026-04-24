@@ -15,7 +15,7 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 print("=" * 60)
-print("Pipeline V21 - Iniciando")
+print("Pipeline V22 - Iniciando")
 print(f"Fecha corrida: {datetime.now(timezone.utc).isoformat()}")
 print("=" * 60)
 
@@ -30,26 +30,6 @@ CHILE_PASS = os.environ.get("CHILE_PASS", "").strip()
 ROFEX_USER = os.environ.get("ROFEX_USER", "")
 ROFEX_PASS = os.environ.get("ROFEX_PASS", "")
 SHEET_NAME = os.environ.get("SHEET_NAME", "Dashboard Macro")
-
-# DEBUG: diagnóstico de secrets (no imprime los valores, solo si están presentes y su longitud)
-print("\n--- DEBUG SECRETS ---")
-for name, value in [
-    ("GEMINI_API_KEY", GEMINI_API_KEY),
-    ("GCP_JSON", GCP_JSON),
-    ("FRED_API_KEY", FRED_API_KEY),
-    ("CHILE_USER", CHILE_USER),
-    ("CHILE_PASS", CHILE_PASS),
-    ("ROFEX_USER", ROFEX_USER),
-    ("ROFEX_PASS", ROFEX_PASS),
-    ("SHEET_NAME", SHEET_NAME),
-]:
-    if value:
-        # Mostrar longitud y primeros/últimos 2 caracteres. Nunca el valor completo.
-        v = str(value)
-        print(f"  {name}: ✓ presente | len={len(v)} | preview='{v[:2]}...{v[-2:]}'")
-    else:
-        print(f"  {name}: ✗ VACÍO o no seteado")
-print("--- FIN DEBUG ---\n")
 
 GEMINI_MODEL_FLASH = "gemini-2.5-flash"
 GEMINI_MODEL_PRO = "gemini-2.5-pro"  # Más robusto para el flash market que fallaba
@@ -304,10 +284,17 @@ SALARIOS_CSV_URL = "https://www.indec.gob.ar/ftp/cuadros/sociedad/indice_salario
 
 def fetch_salarios_indec():
     """
-    CSV oficial INDEC con Índice de Salarios.
-    Columnas habituales: período, nivel general, sector privado registrado,
-    sector público, sector privado no registrado.
-    Usamos NIVEL GENERAL.
+    CSV oficial INDEC con Índice de Salarios (base oct-2016 = 100).
+    FIX V22: V7 estaba tomando la columna incorrecta (IS_total_registrado por el
+    fallback "total") y parseaba fechas sin formato explícito, lo que en algunos
+    runners interpretaba DD/MM/YYYY como MM/DD/YYYY.
+
+    Estructura real del CSV (verificado 2026-04):
+      periodo; IS_sector_privado_registrado; IS_sector_publico;
+      IS_total_registrado; IS_sector_no_registrado; IS_indice_total
+
+    Usamos IS_indice_total (Nivel General, dato oficial INDEC que citan
+    todos los analistas).
     """
     try:
         r = requests.get(SALARIOS_CSV_URL, headers=HEADERS, timeout=30, verify=False)
@@ -315,9 +302,9 @@ def fetch_salarios_indec():
             print(f"  ⚠ Salarios CSV HTTP {r.status_code}")
             return pd.DataFrame()
 
-        # Probar varios encodings
+        # Decode tolerante (UTF-8 con o sin BOM)
         text = None
-        for enc in ["utf-8", "latin-1", "cp1252", "iso-8859-1"]:
+        for enc in ["utf-8-sig", "utf-8", "latin-1", "cp1252"]:
             try:
                 text = r.content.decode(enc)
                 break
@@ -326,48 +313,52 @@ def fetch_salarios_indec():
         if text is None:
             text = r.text
 
-        # Probar separadores
-        for sep in [";", ",", "\t"]:
-            try:
-                df_raw = pd.read_csv(StringIO(text), sep=sep, dtype=str)
-                if len(df_raw.columns) >= 2:
-                    break
-            except Exception:
-                continue
+        # Separador confirmado: ;
+        df_raw = pd.read_csv(StringIO(text), sep=";", dtype=str)
 
-        if len(df_raw.columns) < 2:
-            print(f"  ⚠ Salarios CSV: estructura no reconocida")
+        if df_raw.empty or "periodo" not in df_raw.columns:
+            print(f"  ⚠ Salarios CSV: columna 'periodo' no encontrada. Cols: {list(df_raw.columns)}")
             return pd.DataFrame()
 
-        # Detectar columna de fecha (primera) y de nivel general (segunda)
-        col_fecha = df_raw.columns[0]
-        col_nivel = df_raw.columns[1]  # Nivel general suele ser la primera columna numérica
-
-        # Buscar columna explícita "Nivel general" si existe
+        # Priorizar nombre exacto de nivel general
+        col_is = None
+        candidates_exact = ["IS_indice_total", "IS_indice_general", "indice_general", "nivel_general"]
         for c in df_raw.columns:
-            cl = str(c).lower().strip()
-            if "nivel general" in cl or "general" in cl or "total" in cl:
-                col_nivel = c
+            if str(c).strip() in candidates_exact:
+                col_is = c
                 break
 
-        # Parse fecha
-        df_raw["fecha"] = pd.to_datetime(df_raw[col_fecha], errors="coerce")
-        # Si fecha falló, intentar parsing manual MM/YYYY o YYYY-MM
-        if df_raw["fecha"].isna().all():
-            try:
-                df_raw["fecha"] = pd.to_datetime(df_raw[col_fecha], format="%m/%Y", errors="coerce")
-            except Exception:
-                pass
+        # Fallback: buscar por contenido del nombre (sin matchear "total_registrado")
+        if col_is is None:
+            for c in df_raw.columns:
+                cl = str(c).lower().strip()
+                if "indice_total" in cl or "nivel_general" in cl or "indice_general" in cl:
+                    col_is = c
+                    break
 
+        if col_is is None:
+            print(f"  ⚠ Salarios CSV: no encuentro columna nivel general. Cols: {list(df_raw.columns)}")
+            return pd.DataFrame()
+
+        # Fecha con formato EXPLÍCITO dd/mm/yyyy (evita ambigüedad con locale US)
+        df_raw["fecha"] = pd.to_datetime(df_raw["periodo"], format="%d/%m/%Y", errors="coerce")
+
+        # Valor con coma decimal → punto
         df_raw["IS"] = pd.to_numeric(
-            df_raw[col_nivel].astype(str).str.replace(",", ".").str.replace(" ", ""),
+            df_raw[col_is].astype(str).str.replace(",", ".").str.replace(" ", "").replace("NA", ""),
             errors="coerce"
         )
 
         df = df_raw[["fecha", "IS"]].dropna().sort_values("fecha").reset_index(drop=True)
+
+        if df.empty:
+            print(f"  ⚠ Salarios CSV: DataFrame vacío tras parseo (col usada: {col_is})")
+            return pd.DataFrame()
+
+        print(f"  • Salarios INDEC: columna usada = {col_is}")
         return df
     except Exception as e:
-        print(f"  ⚠ Salarios CSV: {e}")
+        print(f"  ⚠ Salarios CSV: {str(e)[:200]}")
         return pd.DataFrame()
 
 
@@ -492,7 +483,7 @@ salario_real_fechas = []
 salario_real_valores = []
 salario_real_age_days = None
 
-# Usamos df_is_raw (Índice de Salarios oficial INDEC) en lugar de RIPTE
+# Usamos df_is_raw (Índice de Salarios oficial INDEC)
 if not df_is_raw.empty and not df_ipc.empty:
     df_s = df_is_raw.copy()
     df_s["ym"] = df_s["fecha"].dt.to_period("M")
@@ -505,29 +496,42 @@ if not df_is_raw.empty and not df_ipc.empty:
     merged = df_s.merge(df_i[["ym", "IPC"]], on="ym", how="inner").sort_values("ym").reset_index(drop=True)
     print(f"  • Merge salarios+IPC: {len(merged)} filas")
 
-    # FIX: aceptamos desde 12 meses (mes 0 + 11 meses) en vez de 13
-    # Esto evita None cuando el merge da 12 filas exactas
-    if len(merged) >= 12:
-        # Tomar últimos N meses (donde N entre 12 y 13)
-        n_meses = min(13, len(merged))
-        slice_ = merged.tail(n_meses).reset_index(drop=True)
+    # Necesitamos 13 filas estrictas (mes 0 + 12 meses de IPC) para YoY correcto
+    if len(merged) >= 13:
+        # === YoY actual: ventana de 13 meses ===
+        ventana = merged.tail(13).reset_index(drop=True)
+        is_base = float(ventana.iloc[0]["IS"])
+        is_actual = float(ventana.iloc[-1]["IS"])
 
-        # Base = Índice de Salarios del primer mes de la ventana
-        is_base = slice_.iloc[0]["IS"]
+        # Acumular inflación mes a mes (del mes 1 al 12)
+        ipc_acum_yoy = 1.0
+        for i in range(1, 13):
+            ipc_acum_yoy *= (1 + float(ventana.iloc[i]["IPC"]) / 100)
 
-        # Acumulamos inflación mes a mes
-        ipc_acum = 1.0
-        for i in range(1, len(slice_)):
-            ipc_acum *= (1 + slice_.iloc[i]["IPC"] / 100)
-            is_actual = slice_.iloc[i]["IS"]
-            salario_real = (is_actual / is_base) / ipc_acum * 100
-            salario_real_valores.append(round(salario_real, 2))
-            salario_real_fechas.append(slice_.iloc[i]["ym"].strftime("%b %y"))
+        # Índice de salario real base 100 (12 meses atrás)
+        salario_real_idx = (is_actual / is_base) / ipc_acum_yoy * 100
+        salario_real_yoy = round(salario_real_idx - 100, 2)
 
-        if salario_real_valores:
-            salario_real_yoy = round(salario_real_valores[-1] - 100, 2)
+        # Desglose para log (útil para verificar que los números tienen sentido)
+        salario_nominal_yoy = round((is_actual / is_base - 1) * 100, 2)
+        inflacion_yoy_ventana = round((ipc_acum_yoy - 1) * 100, 2)
+        print(f"  • Desglose: nominal={salario_nominal_yoy}% | inflación={inflacion_yoy_ventana}% → real={salario_real_yoy}%")
+
+        # === Trayectoria para gráfico: últimos 24 meses de índice real ===
+        tray_n = min(25, len(merged))
+        tray = merged.tail(tray_n).reset_index(drop=True)
+        is_base_t = float(tray.iloc[0]["IS"])
+        ipc_acum_t = 1.0
+        for i in range(1, len(tray)):
+            ipc_acum_t *= (1 + float(tray.iloc[i]["IPC"]) / 100)
+            is_t = float(tray.iloc[i]["IS"])
+            idx_real = (is_t / is_base_t) / ipc_acum_t * 100
+            salario_real_valores.append(round(idx_real, 2))
+            salario_real_fechas.append(tray.iloc[i]["ym"].strftime("%b %y"))
 
         salario_real_age_days = (pd.Timestamp.now() - df_is_raw["fecha"].iloc[-1]).days
+    else:
+        print(f"  ⚠ Merge salarios+IPC: solo {len(merged)} filas (necesito ≥13 para YoY)")
 
 print(f"  ✓ Salario real: YoY={salario_real_yoy}% | age={salario_real_age_days}d")
 
@@ -905,32 +909,19 @@ if not df_cpi_us.empty and len(df_cpi_us) >= 12:
 print(f"  ✓ EEUU: Fed={tasa_pm_us}% | Inflación YoY={inf_us}%")
 
 
-# Brasil: api.bcb.gov.br - con retry para 502/503 transitorios
-def fetch_bcb_brasil(serie_id, ultimos=15, max_intentos=3):
+# Brasil: api.bcb.gov.br
+def fetch_bcb_brasil(serie_id, ultimos=15):
     url = f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{serie_id}/dados/ultimos/{ultimos}?formato=json"
-    for intento in range(max_intentos):
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=30)
-            if r.status_code == 200:
-                data = r.json()
-                if not data:
-                    return pd.DataFrame()
-                df = pd.DataFrame(data)
-                df["fecha"] = pd.to_datetime(df["data"], format="%d/%m/%Y", errors="coerce")
-                df["valor"] = pd.to_numeric(df["valor"], errors="coerce")
-                return df[["fecha", "valor"]].dropna().sort_values("fecha").reset_index(drop=True)
-            if r.status_code in (502, 503, 504):
-                wait = (intento + 1) * 5
-                print(f"  • BCB {serie_id}: HTTP {r.status_code}, esperando {wait}s (intento {intento+1}/{max_intentos})")
-                time.sleep(wait)
-                continue
-            print(f"  ⚠ BCB {serie_id}: HTTP {r.status_code}")
-            return pd.DataFrame()
-        except Exception as e:
-            print(f"  ⚠ BCB {serie_id} intento {intento+1}: {str(e)[:100]}")
-            time.sleep(3)
-    print(f"  ✗ BCB {serie_id}: agotados intentos")
-    return pd.DataFrame()
+    data = fetch_json(url)
+    if not data:
+        return pd.DataFrame()
+    try:
+        df = pd.DataFrame(data)
+        df["fecha"] = pd.to_datetime(df["data"], format="%d/%m/%Y", errors="coerce")
+        df["valor"] = pd.to_numeric(df["valor"], errors="coerce")
+        return df[["fecha", "valor"]].dropna().sort_values("fecha").reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame()
 
 
 # BCB 433 = IPCA (var % mensual), 432 = Selic meta (% anual)
@@ -1244,7 +1235,7 @@ def _rem_extraer(datos, hoy=None):
     Filas tipo 'anio' → cierre dic-YYYY
     """
     if hoy is None:
-        hoy = pd.Timestamp.utcnow().normalize().tz_localize(None)
+        hoy = pd.Timestamp.now("UTC").tz_localize(None).normalize()
     anio_actual = hoy.year
 
     out = {
@@ -2184,5 +2175,5 @@ if noticias:
     print(f"  ✓ DB_Noticias: {len(df_news)} noticias")
 
 print("\n" + "=" * 60)
-print("Pipeline V21 - Completado")
+print("Pipeline V22 - Completado")
 print("=" * 60)
