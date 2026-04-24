@@ -862,19 +862,25 @@ def ultimo_valor(df):
         return None
 
 
-# EEUU: Fed Funds + CPI
+# EEUU: Fed Funds + CPI - FIX V22: YoY robusto matcheado por fecha
 df_fedfunds = fetch_fred_api("FEDFUNDS")
 df_cpi_us = fetch_fred_api("CPIAUCSL")
 tasa_pm_us = ultimo_valor(df_fedfunds)
-# Inflación YoY USA
+
 inf_us = None
-if not df_cpi_us.empty and len(df_cpi_us) >= 13:
+if not df_cpi_us.empty and len(df_cpi_us) >= 12:
     try:
-        ult = float(df_cpi_us["valor"].iloc[-1])
-        ant = float(df_cpi_us["valor"].iloc[-13])
-        inf_us = round(((ult / ant) - 1) * 100, 2)
-    except Exception:
-        pass
+        df_cpi_us = df_cpi_us.sort_values("fecha").reset_index(drop=True)
+        fecha_ult = df_cpi_us["fecha"].iloc[-1]
+        fecha_target = fecha_ult - pd.DateOffset(months=12)
+        df_cpi_us["_d"] = (df_cpi_us["fecha"] - fecha_target).abs()
+        idx_ant = df_cpi_us["_d"].idxmin()
+        if df_cpi_us["_d"].iloc[idx_ant].days <= 45:
+            ult = float(df_cpi_us["valor"].iloc[-1])
+            ant = float(df_cpi_us["valor"].iloc[idx_ant])
+            inf_us = round(((ult / ant) - 1) * 100, 2)
+    except Exception as e:
+        print(f"  ⚠ YoY EEUU: {e}")
 
 print(f"  ✓ EEUU: Fed={tasa_pm_us}% | Inflación YoY={inf_us}%")
 
@@ -965,24 +971,55 @@ def fetch_bcch_serie(timeseries_id, dias=400):
         return pd.DataFrame()
 
 
-# IPC YoY directo (la serie F073.IPC.V12.Z.M ya viene como variación interanual)
-df_ipc_cl = fetch_bcch_serie("F073.IPC.V12.Z.M")
+# IPC YoY Chile - FIX V22: serie G073.IPC.V12.2023.M (base 2023)
+# La serie F073.IPC.V12.Z.M del V7 dejó de actualizarse al migrar el BCCh a base 2023.
+# Backup: G073.IPC.IND.2023.M (índice) para calcular YoY manual.
+# Fallback final: FRED CHLCPIALLMINMEI.
+df_ipc_cl = fetch_bcch_serie("G073.IPC.V12.2023.M")
 inf_cl = ultimo_valor(df_ipc_cl)
-if df_ipc_cl.empty:
-    # Fallback: FRED Chile CPI calculando YoY manual
-    df_ipc_cl_idx = fetch_fred_api("CHLCPIALLMINMEI")
+
+if inf_cl is None:
+    # Backup 1: índice BCCh base 2023 → YoY manual
+    print(f"  • IPC Chile YoY directo falló, probando índice base 2023...")
+    df_ipc_cl_idx = fetch_bcch_serie("G073.IPC.IND.2023.M")
     if not df_ipc_cl_idx.empty and len(df_ipc_cl_idx) >= 13:
         try:
-            ult = float(df_ipc_cl_idx["valor"].iloc[-1])
-            ant = float(df_ipc_cl_idx["valor"].iloc[-13])
-            inf_cl = round(((ult / ant) - 1) * 100, 2)
+            df_ipc_cl_idx = df_ipc_cl_idx.sort_values("fecha").reset_index(drop=True)
+            fecha_ult = df_ipc_cl_idx["fecha"].iloc[-1]
+            fecha_target = fecha_ult - pd.DateOffset(months=12)
+            df_ipc_cl_idx["_d"] = (df_ipc_cl_idx["fecha"] - fecha_target).abs()
+            idx_ant = df_ipc_cl_idx["_d"].idxmin()
+            if df_ipc_cl_idx["_d"].iloc[idx_ant].days <= 45:
+                ult = float(df_ipc_cl_idx["valor"].iloc[-1])
+                ant = float(df_ipc_cl_idx["valor"].iloc[idx_ant])
+                inf_cl = round(((ult / ant) - 1) * 100, 2)
+        except Exception as e:
+            print(f"  ⚠ Chile IPC backup error: {e}")
+
+if inf_cl is None:
+    # Fallback final: FRED
+    print(f"  • Backup BCCh falló, probando FRED CHLCPIALLMINMEI...")
+    df_ipc_cl_fred = fetch_fred_api("CHLCPIALLMINMEI")
+    if not df_ipc_cl_fred.empty and len(df_ipc_cl_fred) >= 13:
+        try:
+            df_ipc_cl_fred = df_ipc_cl_fred.sort_values("fecha").reset_index(drop=True)
+            fecha_ult = df_ipc_cl_fred["fecha"].iloc[-1]
+            fecha_target = fecha_ult - pd.DateOffset(months=12)
+            df_ipc_cl_fred["_d"] = (df_ipc_cl_fred["fecha"] - fecha_target).abs()
+            idx_ant = df_ipc_cl_fred["_d"].idxmin()
+            if df_ipc_cl_fred["_d"].iloc[idx_ant].days <= 45:
+                ult = float(df_ipc_cl_fred["valor"].iloc[-1])
+                ant = float(df_ipc_cl_fred["valor"].iloc[idx_ant])
+                inf_cl = round(((ult / ant) - 1) * 100, 2)
         except Exception:
             pass
 
-# TPM (Tasa Política Monetaria diaria)
+# TPM Chile - serie activa confirmada F022.TPM.TIN.D001.NO.Z.D (sin cambios)
 df_tpm_cl = fetch_bcch_serie("F022.TPM.TIN.D001.NO.Z.D")
 tasa_pm_cl = ultimo_valor(df_tpm_cl)
 if tasa_pm_cl is None:
+    # Fallback: FRED serie mensual Chile
+    print(f"  • TPM Chile directo falló, probando FRED IR3TIB01CLM156N...")
     df_tpm_cl_fallback = fetch_fred_api("IR3TIB01CLM156N")
     tasa_pm_cl = ultimo_valor(df_tpm_cl_fallback)
 
