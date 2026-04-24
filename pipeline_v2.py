@@ -1123,9 +1123,11 @@ def fetch_rofex_con_pyrofex():
 rofex_futuros = fetch_rofex_con_pyrofex()
 
 
-# REM via API de Facundo Allia (con retry para 429)
-def fetch_rem_endpoint(endpoint, max_intentos=3):
-    """Fetch con retry específico para HTTP 429."""
+# REM via API de Facundo Allia - PARSER FIX V22
+# Bug V7: filtraba por "referencia" pero el campo correcto es "período".
+# Todos los valores REM venían None silenciosamente.
+def fetch_rem_endpoint(endpoint, max_intentos=4):
+    """Fetch con retry exponencial para 429: 15s, 30s, 60s, 90s."""
     url = f"https://bcra-rem-api.facujallia.workers.dev/api/{endpoint}"
     for i in range(max_intentos):
         try:
@@ -1133,67 +1135,174 @@ def fetch_rem_endpoint(endpoint, max_intentos=3):
             if r.status_code == 200:
                 return r.json()
             if r.status_code == 429:
-                wait = (i + 1) * 8  # 8s, 16s, 24s
-                print(f"  • REM {endpoint}: 429, esperando {wait}s...")
+                wait = [15, 30, 60, 90][i]
+                print(f"  • REM {endpoint}: 429, esperando {wait}s (intento {i+1}/{max_intentos})")
                 time.sleep(wait)
                 continue
             print(f"  ⚠ REM {endpoint}: HTTP {r.status_code}")
             return None
         except Exception as e:
-            print(f"  ⚠ REM {endpoint}: {e}")
-            time.sleep(3)
+            print(f"  ⚠ REM {endpoint}: {str(e)[:100]}")
+            time.sleep(5)
+    print(f"  ✗ REM {endpoint}: agotados los intentos")
     return None
 
 
-def fetch_rem_api():
+def _rem_parse_periodo(p):
+    """
+    Parsea el campo 'período' de una fila REM.
+    Devuelve ('anio', int) | ('fecha', Timestamp) | ('str', texto_lower).
+    Orden CRÍTICO: int antes que to_datetime (si no, 2026 se vuelve fecha inválida).
+    """
+    if isinstance(p, (int, float)) and not isinstance(p, bool):
+        ival = int(p)
+        if 2020 <= ival <= 2040:
+            return ("anio", ival)
+    if isinstance(p, str) and "-" in p and len(p) >= 10:
+        try:
+            return ("fecha", pd.to_datetime(p, errors="raise"))
+        except Exception:
+            pass
+    return ("str", str(p).strip().lower())
+
+
+def _rem_extraer(datos, hoy=None):
+    """
+    De la lista 'datos' de un endpoint REM extrae las métricas agregadas.
+    Filas tipo 'fecha' → forward curve mensual
+    Filas tipo 'str' → "próx. 12 meses" / "próx. 24 meses"
+    Filas tipo 'anio' → cierre dic-YYYY
+    """
+    if hoy is None:
+        hoy = pd.Timestamp.utcnow().normalize().tz_localize(None)
+    anio_actual = hoy.year
+
     out = {
+        "mensual_proxima": None,
+        "a_12_meses": None,
+        "a_24_meses": None,
+        "cierre_anio": None,
+        "cierre_anio_prox": None,
+        "forward_curve": [],
+    }
+    if not datos:
+        return out
+
+    forward_rows = []
+    for row in datos:
+        p = row.get("período")
+        mediana = row.get("mediana")
+        if mediana is None:
+            continue
+        tipo, valor = _rem_parse_periodo(p)
+        if tipo == "fecha":
+            if valor >= hoy:
+                forward_rows.append((valor, float(mediana)))
+        elif tipo == "str":
+            if "12 meses" in valor:
+                out["a_12_meses"] = float(mediana)
+            elif "24 meses" in valor:
+                out["a_24_meses"] = float(mediana)
+        elif tipo == "anio":
+            if valor == anio_actual:
+                out["cierre_anio"] = float(mediana)
+            elif valor == anio_actual + 1:
+                out["cierre_anio_prox"] = float(mediana)
+
+    forward_rows.sort(key=lambda x: x[0])
+    if forward_rows:
+        out["mensual_proxima"] = forward_rows[0][1]
+        out["forward_curve"] = [
+            {"fecha": f.strftime("%Y-%m-%d"), "mediana": v}
+            for f, v in forward_rows
+        ]
+    return out
+
+
+def fetch_rem_api():
+    """
+    Devuelve dict con las claves que consume el resto del pipeline + dashboard.
+    Mantenemos las claves legacy (inflacion_12m, tc_12m, etc.) por compatibilidad.
+    Agregamos: inflacion_cierre_anio, inflacion_cierre_anio_prox, tc_cierre_*, tasa_cierre_*,
+               forward curves (ipc, tc, tasa) para gráficos de expectativas.
+    """
+    out = {
+        # Claves legacy (que consume el pipeline/dashboard actual)
         "inflacion_mensual_proxima": None,
         "inflacion_12m": None,
         "tc_12m": None,
         "tasa_12m": None,
         "pbi_trim": None,
+        # Claves nuevas
+        "inflacion_24m": None,
+        "inflacion_cierre_anio": None,
+        "inflacion_cierre_anio_prox": None,
+        "tc_mensual_proxima": None,
+        "tc_24m": None,
+        "tc_cierre_anio": None,
+        "tc_cierre_anio_prox": None,
+        "tasa_mensual_proxima": None,
+        "tasa_24m": None,
+        "tasa_cierre_anio": None,
+        "tasa_cierre_anio_prox": None,
+        # Forward curves (listas de {fecha, mediana})
+        "ipc_forward": [],
+        "tc_forward": [],
+        "tasa_forward": [],
     }
 
     # Inflación
     data = fetch_rem_endpoint("ipc_general")
     if data and "datos" in data:
-        for row in data["datos"]:
-            ref = str(row.get("referencia", "")).lower()
-            if "próx. 12 meses" in ref or "prox. 12 meses" in ref:
-                out["inflacion_12m"] = row.get("mediana")
-            if "mensual" in ref and out["inflacion_mensual_proxima"] is None:
-                out["inflacion_mensual_proxima"] = row.get("mediana")
+        ext = _rem_extraer(data["datos"])
+        out["inflacion_mensual_proxima"] = ext["mensual_proxima"]
+        out["inflacion_12m"] = ext["a_12_meses"]
+        out["inflacion_24m"] = ext["a_24_meses"]
+        out["inflacion_cierre_anio"] = ext["cierre_anio"]
+        out["inflacion_cierre_anio_prox"] = ext["cierre_anio_prox"]
+        out["ipc_forward"] = ext["forward_curve"]
 
-    time.sleep(4)
+    time.sleep(8)
+
+    # Tipo de cambio
     data = fetch_rem_endpoint("tipo_cambio")
     if data and "datos" in data:
-        for row in data["datos"]:
-            ref = str(row.get("referencia", "")).lower()
-            if "próx. 12 meses" in ref or "prox. 12 meses" in ref:
-                out["tc_12m"] = row.get("mediana")
+        ext = _rem_extraer(data["datos"])
+        out["tc_mensual_proxima"] = ext["mensual_proxima"]
+        out["tc_12m"] = ext["a_12_meses"]
+        out["tc_24m"] = ext["a_24_meses"]
+        out["tc_cierre_anio"] = ext["cierre_anio"]
+        out["tc_cierre_anio_prox"] = ext["cierre_anio_prox"]
+        out["tc_forward"] = ext["forward_curve"]
 
-    time.sleep(4)
+    time.sleep(8)
+
+    # Tasa de interés
     data = fetch_rem_endpoint("tasa_interes")
     if data and "datos" in data:
-        for row in data["datos"]:
-            ref = str(row.get("referencia", "")).lower()
-            if "próx. 12 meses" in ref or "prox. 12 meses" in ref:
-                out["tasa_12m"] = row.get("mediana")
+        ext = _rem_extraer(data["datos"])
+        out["tasa_mensual_proxima"] = ext["mensual_proxima"]
+        out["tasa_12m"] = ext["a_12_meses"]
+        out["tasa_24m"] = ext["a_24_meses"]
+        out["tasa_cierre_anio"] = ext["cierre_anio"]
+        out["tasa_cierre_anio_prox"] = ext["cierre_anio_prox"]
+        out["tasa_forward"] = ext["forward_curve"]
 
-    time.sleep(4)
+    time.sleep(8)
+
+    # PBI trimestral (estructura distinta, lo dejamos heredado del V7)
     data = fetch_rem_endpoint("pbi")
-    if data and "datos" in data:
-        datos = data["datos"]
-        if datos:
-            out["pbi_trim"] = datos[0].get("mediana")
+    if data and "datos" in data and data["datos"]:
+        out["pbi_trim"] = data["datos"][0].get("mediana")
 
     return out
 
 
 rem = fetch_rem_api()
-print(f"  ✓ REM: {rem}")
-
-
+print(f"  ✓ REM inflación: mens={rem['inflacion_mensual_proxima']}% | 12m={rem['inflacion_12m']}% | dic-{datetime.now().year}={rem['inflacion_cierre_anio']}%")
+print(f"  ✓ REM dólar: mens=${rem['tc_mensual_proxima']} | 12m=${rem['tc_12m']} | dic-{datetime.now().year}=${rem['tc_cierre_anio']}")
+print(f"  ✓ REM tasa: 12m={rem['tasa_12m']}% | dic-{datetime.now().year}={rem['tasa_cierre_anio']}%")
+print(f"  ✓ REM forward curves: ipc={len(rem['ipc_forward'])}pts | tc={len(rem['tc_forward'])}pts | tasa={len(rem['tasa_forward'])}pts")
 # Ratio dólar futuro / spot
 ratio_dolar_12m_spot = None
 dev_anualizada_implicita = None
