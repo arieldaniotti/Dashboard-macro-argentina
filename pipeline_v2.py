@@ -48,6 +48,7 @@ sh = gspread.authorize(creds).open(SHEET_NAME)
 
 HOY = datetime.today()
 HACE_1A = HOY - timedelta(days=365)
+HACE_400D = HOY - timedelta(days=400)  # margen para comparaciones YoY robustas
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (DashboardMacroAR/21)"}
 
@@ -100,18 +101,29 @@ def abs_diff(new, old):
         return None
 
 
-def get_historical_value(df, col, days_back):
+def get_historical_value(df, col, days_back, tolerancia_dias=20):
+    """
+    Devuelve el valor de la serie `col` correspondiente a hace `days_back` días.
+    
+    FIX V23: con tolerancia. Si pedís un valor de hace 365 días pero la serie
+    arranca exactamente ahí (porque pedimos start=HACE_1A en yfinance), el
+    filtro <= max-365 te puede dejar 0 filas. Tolerancia ±20 días: aceptamos
+    el dato más cercano dentro de esa ventana.
+    """
     try:
         serie = df[["fecha", col]].copy()
         serie[col] = pd.to_numeric(serie[col], errors="coerce")
-        serie = serie.dropna(subset=[col]).drop_duplicates(subset=["fecha"])
+        serie = serie.dropna(subset=[col]).drop_duplicates(subset=["fecha"]).sort_values("fecha")
         if serie.empty:
             return None
         target = serie["fecha"].max() - timedelta(days=days_back)
-        prev = serie[serie["fecha"] <= target]
-        if prev.empty:
+        # Buscar la observación más cercana al target dentro de la tolerancia
+        serie["_d"] = (serie["fecha"] - target).abs()
+        idx_min = serie["_d"].idxmin()
+        delta_dias = serie.loc[idx_min, "_d"].days
+        if delta_dias > tolerancia_dias:
             return None
-        return prev[col].iloc[-1]
+        return serie.loc[idx_min, col]
     except Exception:
         return None
 
@@ -707,29 +719,37 @@ def tna_a_retorno_periodo(tna, meses):
 # cuando en realidad es 88.4%).
 # IDs validados en abril 2026 — series mensuales (1 dato por mes, fin de mes).
 # Hipotecario: el BCRA no publica una serie pura UVA. El BNA bloquea scraping.
-# Usamos hardcoded la TNA UVA del Banco Nación como referencia de mercado.
+# Usamos hardcoded la TNA REAL UVA del Banco Nación. Para hacerla comparable con
+# las otras tasas (todas nominales) la convertimos a TNA NOMINAL multiplicando
+# por (1+inflación esperada). Si no hay inflación REM, asumimos IPC interanual.
 TASAS_FIN_BCRA_IDS = {
     "adelanto_cta_cte":  1199,  # Adelantos en cta cte a tasa fija
     "tarjeta_credito":   1215,  # Financiaciones con tarjetas de crédito
     "prestamo_personal": 1219,  # Préstamos personales a tasa fija
     "sgr_cheque":        1216,  # Documentos a sola firma a tasa fija
 }
-# TNA UVA hipotecario BNA - actualizar manual cada 6 meses si cambia
-# Última verificación: abril 2026
-TASA_HIPOTECARIO_BNA_TNA = 4.5
+# TNA REAL UVA hipotecario BNA (sobre capital ajustado por CER)
+# Actualizar manual cada 6 meses. Última verificación: abril 2026
+TASA_HIPOTECARIO_BNA_TNA_REAL = 4.5
 
 
 def fetch_tasas_financiamiento_bcra():
     """
     Pide las 4 tasas de financiamiento al BCRA v4 (series mensuales).
-    Hipotecario UVA: hardcoded con tasa de referencia BNA (no hay API ni scraping
-    confiable - BNA bloquea con anti-bot).
-    Devuelve dict con las 5 categorías. Si una falla, queda None.
+    Hipotecario UVA: la TNA "real" del BNA (4.5%) se convierte a TNA NOMINAL
+    componiendo con la inflación esperada. Esto la hace comparable con las
+    otras tasas que ya son nominales.
+    
+    El cálculo nominal se hace en una etapa posterior (cuando ya tengamos
+    `rem` o `ipc_yoy`), así que acá devolvemos solo la TNA real y dejamos
+    placeholder. La conversión final se hace abajo.
     """
     out = {}
     for nombre, id_var in TASAS_FIN_BCRA_IDS.items():
         out[nombre] = get_tasa_actual(id_var)
-    out["hipotecario_uva"] = TASA_HIPOTECARIO_BNA_TNA
+    # Placeholder: se ajusta más abajo con la inflación esperada
+    out["hipotecario_uva"] = None  # se setea después
+    out["_hipotecario_uva_real"] = TASA_HIPOTECARIO_BNA_TNA_REAL  # guardar el dato bruto
     return out
 
 
@@ -818,7 +838,7 @@ tickers = {
 df_m = pd.DataFrame()
 for col, tk in tickers.items():
     try:
-        d = yf.download(tk, start=HACE_1A.strftime("%Y-%m-%d"), progress=False, auto_adjust=True)
+        d = yf.download(tk, start=HACE_400D.strftime("%Y-%m-%d"), progress=False, auto_adjust=True)
         if not d.empty:
             df_m[col] = d["Close"]
             print(f"  ✓ {col}: {len(d)} filas")
@@ -1777,6 +1797,22 @@ try:
         print(f"  • Dev esperada 12m (REM): {dev_esperada_12m:.2f}%")
 except Exception:
     pass
+
+# Convertir TNA real UVA a TNA nominal usando inflación esperada
+# Fórmula: (1 + tna_real) × (1 + inflación) - 1
+# Esto hace que el hipotecario UVA sea comparable con el resto de tasas (todas nominales).
+# Sin esta conversión, el cálculo de costo en USD daba un signo invertido.
+inflacion_para_uva = rem.get("inflacion_12m") or ipc_yoy
+if inflacion_para_uva and tasas_fin.get("_hipotecario_uva_real") is not None:
+    tna_real = tasas_fin["_hipotecario_uva_real"] / 100
+    inf = float(inflacion_para_uva) / 100
+    tasas_fin["hipotecario_uva"] = round(((1 + tna_real) * (1 + inf) - 1) * 100, 2)
+    print(f"  • Hipotecario UVA: real={tna_real*100:.1f}% × inf={inf*100:.1f}% → nominal={tasas_fin['hipotecario_uva']}%")
+else:
+    # Fallback: si no tenemos inflación, asumimos 30% (proxy 2026)
+    tna_real = (tasas_fin.get("_hipotecario_uva_real") or 4.5) / 100
+    tasas_fin["hipotecario_uva"] = round(((1 + tna_real) * 1.30 - 1) * 100, 2)
+    print(f"  ⚠ Hipotecario UVA: sin inflación esperada, uso fallback 30% → nominal={tasas_fin['hipotecario_uva']}%")
 
 
 financiamiento_1m = {
