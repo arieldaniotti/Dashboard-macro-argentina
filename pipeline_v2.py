@@ -702,24 +702,28 @@ def tna_a_retorno_periodo(tna, meses):
     return round(((1 + tasa_mensual) ** meses - 1) * 100, 2)
 
 
-# FIX V22: tasas reales del BCRA v4 (antes eran heurísticas BADLAR + spreads inventados).
+# FIX V23: tasas REALES del BCRA v4 (antes V22 usaba heurísticas BADLAR + spreads
+# inventados que daban valores muy alejados de la realidad - tarjeta daba 47%
+# cuando en realidad es 88.4%).
 # IDs validados en abril 2026 — series mensuales (1 dato por mes, fin de mes).
-# Hipotecario: el BCRA no tiene una serie pura UVA. Usamos como referencia la tasa
-# hipotecaria del Banco Nación (~4.5% TNA UVA, valor estable que se actualiza pocas
-# veces al año). Si el valor cambia, actualizar acá manualmente.
+# Hipotecario: el BCRA no publica una serie pura UVA. El BNA bloquea scraping.
+# Usamos hardcoded la TNA UVA del Banco Nación como referencia de mercado.
 TASAS_FIN_BCRA_IDS = {
     "adelanto_cta_cte":  1199,  # Adelantos en cta cte a tasa fija
     "tarjeta_credito":   1215,  # Financiaciones con tarjetas de crédito
     "prestamo_personal": 1219,  # Préstamos personales a tasa fija
     "sgr_cheque":        1216,  # Documentos a sola firma a tasa fija
 }
-TASA_HIPOTECARIO_BNA_TNA = 4.5  # Banco Nación, UVA. Última verificación: abril 2026
+# TNA UVA hipotecario BNA - actualizar manual cada 6 meses si cambia
+# Última verificación: abril 2026
+TASA_HIPOTECARIO_BNA_TNA = 4.5
 
 
 def fetch_tasas_financiamiento_bcra():
     """
     Pide las 4 tasas de financiamiento al BCRA v4 (series mensuales).
-    Hipotecario UVA: hardcoded con tasa de referencia BNA (no hay API).
+    Hipotecario UVA: hardcoded con tasa de referencia BNA (no hay API ni scraping
+    confiable - BNA bloquea con anti-bot).
     Devuelve dict con las 5 categorías. Si una falla, queda None.
     """
     out = {}
@@ -1725,25 +1729,54 @@ valor_real_1a = {
 }
 
 
-def costo_fin_usd(tna, meses, bench):
+def costo_fin_usd(tna, meses, bench, dev_esperada_pct=None):
+    """
+    Costo real en USD de financiamiento.
+    
+    FIX V23: para horizonte de 12 meses, usar devaluación ESPERADA (REM) en
+    lugar de la histórica de los últimos 12 meses. La histórica subestima
+    el costo real porque Argentina 2025-2026 tuvo devaluación moderada por
+    cepo, pero el REM proyecta ~25% para los próximos 12 meses.
+    
+    Si se pasa `dev_esperada_pct` (en %, ej: 25.8 para 25.8%), se usa esa
+    devaluación. Si no, se usa la histórica de los últimos `meses` meses.
+    """
     if tna is None or bench is None:
         return None
     try:
         rend = tna_a_retorno_periodo(tna, meses) / 100
-        df_of = macro_dfs["oficial"]
-        dev = 0
-        if not df_of.empty:
-            usd_hoy = float(df_of["USD_Oficial"].iloc[-1])
-            tgt = HOY - timedelta(days=30 * meses)
-            rows = df_of[df_of["fecha"] <= tgt]
-            if not rows.empty:
-                usd_ant = float(rows["USD_Oficial"].iloc[-1])
-                dev = (usd_hoy / usd_ant) - 1
+        
+        if dev_esperada_pct is not None:
+            # Usar devaluación esperada REM (ya viene como % anualizada)
+            dev = dev_esperada_pct / 100
+        else:
+            # Devaluación histórica del período
+            df_of = macro_dfs["oficial"]
+            dev = 0
+            if not df_of.empty:
+                usd_hoy = float(df_of["USD_Oficial"].iloc[-1])
+                tgt = HOY - timedelta(days=30 * meses)
+                rows = df_of[df_of["fecha"] <= tgt]
+                if not rows.empty:
+                    usd_ant = float(rows["USD_Oficial"].iloc[-1])
+                    dev = (usd_hoy / usd_ant) - 1
         if (1 + dev) == 0:
             return None
         return round(((1 + rend) / (1 + dev) - 1) * 100, 2)
     except Exception:
         return None
+
+
+# Devaluación esperada 12m del REM (mediana de analistas)
+# Si REM no tiene dato, fallback a histórica
+dev_esperada_12m = None
+try:
+    if rem.get("tc_12m") and not macro_dfs["oficial"].empty:
+        usd_spot_actual = float(macro_dfs["oficial"]["USD_Oficial"].iloc[-1])
+        dev_esperada_12m = ((float(rem["tc_12m"]) / usd_spot_actual) - 1) * 100
+        print(f"  • Dev esperada 12m (REM): {dev_esperada_12m:.2f}%")
+except Exception:
+    pass
 
 
 financiamiento_1m = {
@@ -1754,12 +1787,13 @@ financiamiento_1m = {
     "Cheques SGR descuento": costo_fin_usd(tasas_fin["sgr_cheque"], 1, bench_1m),
 }
 
+# Para horizonte 12m: pasamos dev esperada REM si está disponible
 financiamiento_1a = {
-    "Adelanto Cta Cte": costo_fin_usd(tasas_fin["adelanto_cta_cte"], 12, bench_1a),
-    "Tarjeta crédito": costo_fin_usd(tasas_fin["tarjeta_credito"], 12, bench_1a),
-    "Préstamo Personal": costo_fin_usd(tasas_fin["prestamo_personal"], 12, bench_1a),
-    "Hipotecario UVA": costo_fin_usd(tasas_fin["hipotecario_uva"], 12, bench_1a),
-    "Cheques SGR descuento": costo_fin_usd(tasas_fin["sgr_cheque"], 12, bench_1a),
+    "Adelanto Cta Cte": costo_fin_usd(tasas_fin["adelanto_cta_cte"], 12, bench_1a, dev_esperada_12m),
+    "Tarjeta crédito": costo_fin_usd(tasas_fin["tarjeta_credito"], 12, bench_1a, dev_esperada_12m),
+    "Préstamo Personal": costo_fin_usd(tasas_fin["prestamo_personal"], 12, bench_1a, dev_esperada_12m),
+    "Hipotecario UVA": costo_fin_usd(tasas_fin["hipotecario_uva"], 12, bench_1a, dev_esperada_12m),
+    "Cheques SGR descuento": costo_fin_usd(tasas_fin["sgr_cheque"], 12, bench_1a, dev_esperada_12m),
 }
 
 
