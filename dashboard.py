@@ -575,16 +575,31 @@ def tabla_valor_real(items_dict, bench, is_credit=False):
 # -----------------------------------------------------------
 # BARRA HORIZONTAL (Macro Global)
 # -----------------------------------------------------------
-def bar_horizontal_etiq(labels, values, color="#38bdf8", height=220, unit="%", decimals=2):
-    """Barras horizontales con etiquetas claras al final."""
+def bar_horizontal_etiq(labels, values, color="#38bdf8", height=220, unit="%", decimals=2,
+                        color_by_sign=False, color_pos="#10b981", color_neg="#f87171"):
+    """Barras horizontales con etiquetas claras al final.
+
+    FIX V25: agrego `color_by_sign` para que cuando se compara una métrica donde
+    el signo importa (ej: tasa real, donde negativo es malo y positivo bueno),
+    cada barra tome color verde o rojo según su valor. Para Argentina con tasa
+    real negativa esto la distingue visualmente del resto de países.
+    """
     text_labels = [f"{v:+.{decimals}f}{unit}" if v is not None else "N/D" for v in values]
     values_plot = [v if v is not None else 0 for v in values]
+
+    if color_by_sign:
+        marker_colors = [
+            color_pos if (v is not None and v >= 0) else color_neg
+            for v in values
+        ]
+    else:
+        marker_colors = color  # color único para toda la serie
 
     fig = go.Figure()
     fig.add_trace(go.Bar(
         y=labels, x=values_plot,
         orientation="h",
-        marker=dict(color=color),
+        marker=dict(color=marker_colors),
         text=text_labels, textposition="outside",
         textfont=dict(color="#f8fafc", size=13, family="monospace"),
         hovertemplate="%{y}: %{text}<extra></extra>",
@@ -778,9 +793,12 @@ with tab_global:
             st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
         # Fila 2: Tasa Real (full width, porque es la métrica clave)
+        # FIX V25: color_by_sign para que tasas negativas (Argentina típicamente)
+        # aparezcan en rojo y positivas en verde, distinguiéndolas visualmente.
         st.markdown('<div class="subsection-title">Tasa real anual (nominal − inflación)</div>', unsafe_allow_html=True)
         values = [macro_global.get(p, {}).get("tasa_real") for p in paises_orden]
-        bar_horizontal_etiq(labels, values, color="#10b981", height=200, unit="%", decimals=2)
+        bar_horizontal_etiq(labels, values, height=200, unit="%", decimals=2,
+                            color_by_sign=True)
 
         st.caption("💡 Tasa real positiva = capital real ganando poder de compra. Argentina usa Plazo Fijo 30d como tasa de referencia; Brasil y Chile usan su tasa de política monetaria.")
 
@@ -839,10 +857,14 @@ with tab_local:
     # FIX V11: dos benchmarks distintos para mantener consistencia conceptual.
     # - Inversiones: bench HISTÓRICO (pesos quietos vs USD pasado, retorno realizado)
     # - Financiamiento: bench ESPERADO (pesos quietos vs USD proyectado REM)
-    # Antes ambas tablas usaban el mismo bench y los spreads no eran comparables.
+    # FIX V25: ahora también el mensual usa bench_1m_esperado para financiamiento
+    # (antes ambas tablas mensuales usaban bench_1m, dando el mismo número en ambas).
     if intervalo == "Mensual":
         bench_inv = get_insight_float("bench_1m", default=0.0) or 0.0
-        bench_fin = get_insight_float("bench_1m", default=0.0) or 0.0  # 1M usa histórico en ambos
+        bench_fin = get_insight_float("bench_1m_esperado", default=None)
+        if bench_fin is None:
+            # Fallback al histórico si no está el esperado (compat retro)
+            bench_fin = bench_inv
         rendimientos = get_json("valor_real_1m_json", {})
         financiamiento = get_json("financiamiento_1m_json", {})
         analisis_vr = get_insight("analisis_vr_1m", "")
@@ -877,13 +899,17 @@ with tab_local:
     with col_fin:
         st.subheader("💳 Costo de financiamiento en USD")
         # FIX V11: copy diferenciado - financiamiento mira al futuro (costo proyectado)
+        # FIX V25: ahora también el mensual usa benchmark forward-looking
         if intervalo == "Anual":
             sub_fin = (
                 f"Benchmark dólares quietos (próximos 12m esperado REM): "
                 f"{bench_fin:+.2f}%"
             )
         else:
-            sub_fin = f"Benchmark dólares quietos (últimos 30d): {bench_fin:+.2f}%"
+            sub_fin = (
+                f"Benchmark dólares quietos (próximos 30d esperado REM): "
+                f"{bench_fin:+.2f}%"
+            )
         st.caption(sub_fin)
         if financiamiento:
             tabla_valor_real(financiamiento, bench_fin, is_credit=True)
@@ -1036,8 +1062,15 @@ with tab_exp:
             st.info("Sin datos de vencimientos todavía.")
 
     # === ANÁLISIS LLM ===
+    # FIX V25: detectar también placeholders "Sin análisis disponible" para mostrar
+    # el mensaje de pendiente en vez del placeholder textual.
     analisis_exp = get_insight("analisis_expectativas", "")
-    if analisis_exp:
+    es_placeholder = (
+        not analisis_exp
+        or analisis_exp.strip().lower().startswith("sin análisis")
+        or analisis_exp.strip().lower().startswith("sin analisis")
+    )
+    if not es_placeholder:
         st.markdown(
             f'<div class="ai-box" style="margin-top:20px;">'
             f'<div style="color:#38bdf8;font-weight:bold;margin-bottom:8px;font-size:13px;">'
@@ -1047,4 +1080,4 @@ with tab_exp:
             unsafe_allow_html=True,
         )
     else:
-        st.info("Análisis del LLM pendiente.")
+        st.info("Análisis del LLM pendiente. Se actualiza con la próxima corrida del pipeline.")
