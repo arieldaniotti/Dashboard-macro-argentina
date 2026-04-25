@@ -316,9 +316,25 @@ def render_kpi(title, col, prefix="", suffix="", is_inverted=False, mode="ratio"
 # -----------------------------------------------------------
 def macro_card_integrated(label, valor_str, subtexto, delta_text, delta_color,
                           serie_valores, serie_fechas, color_hex, age_days=None):
+    # FIX V11: en vez de "Dato de hace XXd" mostrar el mes/año del dato concreto.
+    # Mucho más claro para el usuario: "Dato: Feb 2026" >> "Dato de hace 83d".
     age_html = ""
-    if age_days is not None and age_days > 45:
-        age_html = f'<div style="font-size:10px; color:#64748b; margin-top:3px;">Dato de hace {age_days}d</div>'
+    if age_days is not None and age_days > 30:
+        try:
+            from datetime import datetime as _dt, timedelta as _td
+            fecha_dato = _dt.now() - _td(days=int(age_days))
+            meses_es = ["Ene", "Feb", "Mar", "Abr", "May", "Jun",
+                        "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"]
+            etiqueta = f"{meses_es[fecha_dato.month - 1]} {fecha_dato.year}"
+            age_html = (
+                f'<div style="font-size:10px; color:#64748b; margin-top:3px;">'
+                f'Dato: {etiqueta}</div>'
+            )
+        except Exception:
+            age_html = (
+                f'<div style="font-size:10px; color:#64748b; margin-top:3px;">'
+                f'Dato de hace {age_days}d</div>'
+            )
 
     st.markdown(
         f'<div style="background: linear-gradient(135deg, #0b0e18 0%, #0f1420 100%);'
@@ -642,17 +658,19 @@ def bar_vertical(labels, values, color="#38bdf8", height=280, value_format="numb
 
 
 # -----------------------------------------------------------
-# TABS (solo 4)
+# TABS (orden V11): Resumen → Macro Local → Expectativas → Macro Global
+# Nota: las variables tab_resumen / tab_local / tab_exp / tab_global se asignan
+# en ese ORDEN VISUAL. Los bloques `with tab_xxx:` están más abajo en el código.
 # -----------------------------------------------------------
 st.title("📊 Dashboard Económico Financiero")
-tab1, tab2, tab3, tab4 = st.tabs([
-    "📌 Resumen", "🌎 Macro Global", "🇦🇷 Argentina", "🔮 Expectativas",
+tab_resumen, tab_local, tab_exp, tab_global = st.tabs([
+    "📌 Resumen", "🇦🇷 Macro Local", "🔮 Expectativas", "🌎 Macro Global",
 ])
 
 # ===========================================================
-# TAB 1 - RESUMEN
+# TAB - RESUMEN
 # ===========================================================
-with tab1:
+with tab_resumen:
     st.markdown('<div class="section-title">🌐 MUNDO</div>', unsafe_allow_html=True)
     c1, c2, c3, c4 = st.columns(4)
     with c1: render_kpi("S&P 500", "SP500", mode="ratio")
@@ -717,9 +735,9 @@ with tab1:
 
 
 # ===========================================================
-# TAB 2 - MACRO GLOBAL
+# TAB - MACRO GLOBAL
 # ===========================================================
-with tab2:
+with tab_global:
     st.markdown('<div class="section-title">🌎 COMPARATIVA REGIONAL</div>', unsafe_allow_html=True)
 
     macro_global = get_json("macro_global_json", {})
@@ -784,9 +802,9 @@ with tab2:
 
 
 # ===========================================================
-# TAB 3 - ARGENTINA
+# TAB - MACRO LOCAL (antes "Argentina")
 # ===========================================================
-with tab3:
+with tab_local:
     st.markdown('<div class="section-title">🇦🇷 SEMÁFORO MACROECONÓMICO</div>', unsafe_allow_html=True)
 
     col_a, col_b, col_c = st.columns(3)
@@ -818,31 +836,57 @@ with tab3:
 
     intervalo = st.radio("Intervalo:", ["Mensual", "Anual"], horizontal=True, label_visibility="collapsed")
 
+    # FIX V11: dos benchmarks distintos para mantener consistencia conceptual.
+    # - Inversiones: bench HISTÓRICO (pesos quietos vs USD pasado, retorno realizado)
+    # - Financiamiento: bench ESPERADO (pesos quietos vs USD proyectado REM)
+    # Antes ambas tablas usaban el mismo bench y los spreads no eran comparables.
     if intervalo == "Mensual":
-        bench = get_insight_float("bench_1m", default=0.0) or 0.0
+        bench_inv = get_insight_float("bench_1m", default=0.0) or 0.0
+        bench_fin = get_insight_float("bench_1m", default=0.0) or 0.0  # 1M usa histórico en ambos
         rendimientos = get_json("valor_real_1m_json", {})
         financiamiento = get_json("financiamiento_1m_json", {})
         analisis_vr = get_insight("analisis_vr_1m", "")
     else:
-        bench = get_insight_float("bench_1a", default=0.0) or 0.0
+        bench_inv = get_insight_float("bench_1a", default=0.0) or 0.0
+        bench_fin = get_insight_float("bench_1a_esperado", default=None)
+        if bench_fin is None:
+            # Fallback al histórico si no está el esperado (compat retro)
+            bench_fin = bench_inv
         rendimientos = get_json("valor_real_1a_json", {})
         financiamiento = get_json("financiamiento_1a_json", {})
         analisis_vr = get_insight("analisis_vr_1a", "")
 
+    # FIX V11: sacar BADLAR de la tabla de inversiones (por pedido del usuario:
+    # ya tenemos Plazo Fijo 30d que es el equivalente práctico para retail).
+    rendimientos = {k: v for k, v in rendimientos.items() if k != "BADLAR"}
+
     col_inv, col_fin = st.columns(2)
     with col_inv:
         st.subheader("💰 Inversiones en USD")
-        st.caption(f"Benchmark dólares quietos: {bench:+.2f}%")
+        # FIX V11: copy diferenciado - inversiones miran al pasado (rendimiento ya realizado)
+        sub_inv = (
+            f"Benchmark dólares quietos (últimos {'12m' if intervalo == 'Anual' else '30d'}): "
+            f"{bench_inv:+.2f}%"
+        )
+        st.caption(sub_inv)
         if rendimientos:
-            tabla_valor_real(rendimientos, bench, is_credit=False)
+            tabla_valor_real(rendimientos, bench_inv, is_credit=False)
         else:
             st.info("Sin datos de rendimientos todavía.")
 
     with col_fin:
         st.subheader("💳 Costo de financiamiento en USD")
-        st.caption(f"Benchmark dólares quietos: {bench:+.2f}%")
+        # FIX V11: copy diferenciado - financiamiento mira al futuro (costo proyectado)
+        if intervalo == "Anual":
+            sub_fin = (
+                f"Benchmark dólares quietos (próximos 12m esperado REM): "
+                f"{bench_fin:+.2f}%"
+            )
+        else:
+            sub_fin = f"Benchmark dólares quietos (últimos 30d): {bench_fin:+.2f}%"
+        st.caption(sub_fin)
         if financiamiento:
-            tabla_valor_real(financiamiento, bench, is_credit=True)
+            tabla_valor_real(financiamiento, bench_fin, is_credit=True)
         else:
             st.info("Sin datos de financiamiento todavía.")
 
@@ -859,9 +903,9 @@ with tab3:
 
 
 # ===========================================================
-# TAB 4 - EXPECTATIVAS
+# TAB - EXPECTATIVAS
 # ===========================================================
-with tab4:
+with tab_exp:
     st.markdown('<div class="section-title">🔮 EXPECTATIVAS DE MERCADO</div>', unsafe_allow_html=True)
 
     # === FILA 1 DE TARJETAS: 4 KPIs ===
@@ -938,16 +982,45 @@ with tab4:
     col_fut, col_venc = st.columns(2)
 
     with col_fut:
-        st.markdown('<div class="subsection-title">Curva futuros de dólar (ROFEX)</div>', unsafe_allow_html=True)
-        futuros = get_json("rofex_futuros_json", [])
-        if futuros:
-            labels = [str(f.get("vencimiento", "")) for f in futuros[:8]]
-            values = [float(f.get("precio", 0)) for f in futuros[:8]]
-            # Números completos (no abreviados) para curva
+        st.markdown('<div class="subsection-title">Curva futuros de dólar</div>', unsafe_allow_html=True)
+        # FIX V11: usar tc_forward de REM (siempre disponible, mediana analistas BCRA)
+        # con fallback a ROFEX si hay credenciales.
+        rem_data = get_json("rem_json", {}) or {}
+        tc_forward = rem_data.get("tc_forward") if isinstance(rem_data, dict) else None
+        rofex = get_json("rofex_futuros_json", [])
+
+        labels, values, fuente = [], [], None
+
+        if tc_forward and isinstance(tc_forward, list) and len(tc_forward) > 0:
+            # Forward curve REM: lista de {fecha, mediana}
+            meses_es = {"01": "Ene", "02": "Feb", "03": "Mar", "04": "Abr",
+                        "05": "May", "06": "Jun", "07": "Jul", "08": "Ago",
+                        "09": "Sep", "10": "Oct", "11": "Nov", "12": "Dic"}
+            for pt in tc_forward[:8]:
+                try:
+                    fecha = str(pt.get("fecha", ""))
+                    if len(fecha) >= 7:
+                        # "2026-04-30" → "Abr 26"
+                        anio_corto = fecha[2:4]
+                        mes = meses_es.get(fecha[5:7], fecha[5:7])
+                        labels.append(f"{mes} {anio_corto}")
+                        values.append(float(pt.get("mediana", 0)))
+                except Exception:
+                    continue
+            fuente = "Mediana REM (BCRA)"
+
+        elif rofex:
+            labels = [str(f.get("vencimiento", "")) for f in rofex[:8]]
+            values = [float(f.get("precio", 0)) for f in rofex[:8]]
+            fuente = "ROFEX"
+
+        if labels and values:
             bar_vertical(labels, values, color="#38bdf8", height=280,
-                        value_format="number", prefix="$")
+                         value_format="number", prefix="$")
+            if fuente:
+                st.caption(f"Fuente: {fuente}")
         else:
-            st.info("Curva de futuros: esperando credenciales ROFEX o dato REM.")
+            st.info("Curva de futuros: sin datos disponibles.")
 
     with col_venc:
         st.markdown('<div class="subsection-title">Vencimientos deuda soberana (USD)</div>', unsafe_allow_html=True)
