@@ -702,22 +702,35 @@ def tna_a_retorno_periodo(tna, meses):
     return round(((1 + tasa_mensual) ** meses - 1) * 100, 2)
 
 
-# Estimaciones de tasas de financiamiento (basadas en BADLAR + spreads)
-def estimar_tasa_financiamiento():
-    if tasa_badlar is None:
-        return {k: None for k in ["adelanto_cta_cte", "tarjeta_credito", "prestamo_personal",
-                                   "hipotecario_uva", "sgr_cheque"]}
-    return {
-        "adelanto_cta_cte": round(tasa_badlar + 15, 1),
-        "tarjeta_credito": round(tasa_badlar + 25, 1),
-        "prestamo_personal": round(tasa_badlar + 20, 1),
-        "hipotecario_uva": 8.0,
-        "sgr_cheque": round(tasa_badlar - 5, 1),
-    }
+# FIX V22: tasas reales del BCRA v4 (antes eran heurísticas BADLAR + spreads inventados).
+# IDs validados en abril 2026 — series mensuales (1 dato por mes, fin de mes).
+# Hipotecario: el BCRA no tiene una serie pura UVA. Usamos como referencia la tasa
+# hipotecaria del Banco Nación (~4.5% TNA UVA, valor estable que se actualiza pocas
+# veces al año). Si el valor cambia, actualizar acá manualmente.
+TASAS_FIN_BCRA_IDS = {
+    "adelanto_cta_cte":  1199,  # Adelantos en cta cte a tasa fija
+    "tarjeta_credito":   1215,  # Financiaciones con tarjetas de crédito
+    "prestamo_personal": 1219,  # Préstamos personales a tasa fija
+    "sgr_cheque":        1216,  # Documentos a sola firma a tasa fija
+}
+TASA_HIPOTECARIO_BNA_TNA = 4.5  # Banco Nación, UVA. Última verificación: abril 2026
 
 
-tasas_fin = estimar_tasa_financiamiento()
-print(f"  ✓ Financiamiento: {tasas_fin}")
+def fetch_tasas_financiamiento_bcra():
+    """
+    Pide las 4 tasas de financiamiento al BCRA v4 (series mensuales).
+    Hipotecario UVA: hardcoded con tasa de referencia BNA (no hay API).
+    Devuelve dict con las 5 categorías. Si una falla, queda None.
+    """
+    out = {}
+    for nombre, id_var in TASAS_FIN_BCRA_IDS.items():
+        out[nombre] = get_tasa_actual(id_var)
+    out["hipotecario_uva"] = TASA_HIPOTECARIO_BNA_TNA
+    return out
+
+
+tasas_fin = fetch_tasas_financiamiento_bcra()
+print(f"  ✓ Financiamiento BCRA: {tasas_fin}")
 
 
 # ---------------------------------------------------------------
