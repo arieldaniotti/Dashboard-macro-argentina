@@ -198,26 +198,24 @@ EMAE_XLS_URL = "https://www.indec.gob.ar/ftp/cuadros/economia/sh_emae_mensual_ba
 def fetch_emae_from_indec_xls():
     """
     Descarga el XLS oficial del EMAE base 2004 directo del INDEC.
-    
-    FIX V23: el parser anterior fallaba por dos razones:
-    1) Probaba columnas 1-5 secuencialmente y se quedaba con la PRIMERA numérica
-       válida → agarraba la SERIE ORIGINAL (col 2) en vez de DESESTACIONALIZADA (col 4)
-    2) Tenía un bug latente: la columna 1 contiene el mes en TEXTO, así que el
-       primer "first_val numérico" siempre era col 2. Pero esto pasaba para todas
-       las filas, así que ni siquiera era el bug declarado en el log.
-    
+
+    FIX V24: ahora trae AMBAS series (original + desestacionalizada).
+    - Serie original (col 2): se usa para calcular YoY (es como reporta INDEC)
+    - Serie desestacionalizada (col 4): se usa para nivel y tendencia mensual
+
     Estructura confirmada del Excel (validado en Colab abril 2026):
       col 0: Año (solo poblada en filas de enero)
       col 1: Mes en español ("Enero", "Febrero", ...)
-      col 2: Índice Serie Original (con estacionalidad)
+      col 2: Índice Serie ORIGINAL (con estacionalidad)
       col 3: Var % i.a. de la serie original
-      col 4: Índice Serie DESESTACIONALIZADA  ← LA QUE USAMOS
+      col 4: Índice Serie DESESTACIONALIZADA
       col 5: Var % m/m de la desestacionalizada
       col 6: Índice Serie Tendencia-Ciclo
       col 7: Var % m/m de la tendencia
-    
-    La serie desestacionalizada es la que reporta INDEC en sus comunicados de
-    prensa y la estándar para análisis de coyuntura.
+
+    Devuelve DataFrame con columnas: fecha, EMAE_original, EMAE_desest.
+    Mantiene también la columna EMAE como alias de EMAE_desest por compatibilidad
+    con el resto del código (que usa "EMAE" como nombre canónico para nivel).
     """
     try:
         r = requests.get(EMAE_XLS_URL, headers=HEADERS, timeout=60, verify=False)
@@ -229,7 +227,6 @@ def fetch_emae_from_indec_xls():
         with open(tmp_path, "wb") as f:
             f.write(r.content)
 
-        # Probar engines en orden: xlrd para .xls antiguos, openpyxl si fuera .xlsx
         df_raw = None
         for engine in ["xlrd", "openpyxl"]:
             try:
@@ -249,11 +246,9 @@ def fetch_emae_from_indec_xls():
 
         rows = []
         anio_actual = None
-        # Estructura conocida: año en col 0 (solo enero), mes en col 1, desest en col 4
         for idx in range(len(df_raw)):
             row = df_raw.iloc[idx]
 
-            # ¿Hay año en columna 0?
             v_anio = row.iloc[0]
             if pd.notna(v_anio):
                 try:
@@ -263,7 +258,6 @@ def fetch_emae_from_indec_xls():
                 except Exception:
                     pass
 
-            # ¿Hay mes en columna 1?
             v_mes = row.iloc[1] if df_raw.shape[1] > 1 else None
             if pd.isna(v_mes) or anio_actual is None:
                 continue
@@ -272,17 +266,19 @@ def fetch_emae_from_indec_xls():
             if mes_num is None:
                 continue
 
-            # SIEMPRE columna 4 (desestacionalizada). Sin loop ni adivinanza.
             if df_raw.shape[1] < 5:
                 continue
-            v_desest = row.iloc[4]
+
+            # Original (col 2) y desestacionalizada (col 4)
             try:
-                val = float(v_desest)
-                if not (50 < val < 300):  # Sanity check: rango plausible base 2004=100
+                v_orig = float(row.iloc[2])
+                v_desest = float(row.iloc[4])
+                if not (50 < v_orig < 300) or not (50 < v_desest < 300):
                     continue
                 rows.append({
                     "fecha": pd.Timestamp(year=anio_actual, month=mes_num, day=1),
-                    "EMAE": val,
+                    "EMAE_original": v_orig,
+                    "EMAE_desest": v_desest,
                 })
             except Exception:
                 continue
@@ -292,6 +288,8 @@ def fetch_emae_from_indec_xls():
             return pd.DataFrame()
 
         df = pd.DataFrame(rows).drop_duplicates(subset=["fecha"]).sort_values("fecha").reset_index(drop=True)
+        # Alias por compatibilidad: EMAE = serie desestacionalizada (lo que se usa para nivel)
+        df["EMAE"] = df["EMAE_desest"]
         return df
     except Exception as e:
         print(f"  ⚠ EMAE XLS error: {str(e)[:200]}")
@@ -497,14 +495,30 @@ emae_fechas_12m, emae_valores_12m = [], []
 emae_age_days = None
 
 if not df_emae_raw.empty:
+    # Nivel: usamos serie DESESTACIONALIZADA (alias EMAE)
     emae_val = float(df_emae_raw["EMAE"].iloc[-1])
     last_date = df_emae_raw["fecha"].iloc[-1]
     emae_age_days = (pd.Timestamp.now() - last_date).days
+
+    # YoY: FIX V24 - se calcula sobre la serie ORIGINAL (alineado con INDEC oficial).
+    # INDEC publica la "variación interanual" sobre la serie original. Hacerlo
+    # sobre la desest da números distintos porque la desestacionalización elimina
+    # parte del componente cíclico-anual.
     target = last_date - pd.DateOffset(months=12)
     ant = df_emae_raw[df_emae_raw["fecha"] <= target]
-    if not ant.empty:
+    if not ant.empty and "EMAE_original" in df_emae_raw.columns:
+        try:
+            v_actual_orig = float(df_emae_raw["EMAE_original"].iloc[-1])
+            v_ant_orig = float(ant["EMAE_original"].iloc[-1])
+            delta = pct_change(v_actual_orig, v_ant_orig)
+            emae_yoy = round(delta, 2) if delta is not None else None
+        except Exception:
+            pass
+    elif not ant.empty:
+        # Fallback: si no tenemos serie original (caso raro), usar la genérica
         delta = pct_change(emae_val, ant["EMAE"].iloc[-1])
         emae_yoy = round(delta, 2) if delta is not None else None
+
     emae_fechas_12m, emae_valores_12m = serie_12m(df_emae_raw, "EMAE")
 
 print(f"  ✓ EMAE: val={emae_val} | YoY={emae_yoy}% | age={emae_age_days}d")
@@ -739,16 +753,13 @@ def tna_a_retorno_periodo(tna, meses):
     return round(((1 + tasa_mensual) ** meses - 1) * 100, 2)
 
 
-# FIX V23: tasas REALES del BCRA v4 (antes V22 usaba heurísticas BADLAR + spreads
-# inventados que daban valores muy alejados de la realidad - tarjeta daba 47%
-# cuando en realidad es 88.4%).
+# FIX V24: tasas REALES del BCRA v4 (4 categorías).
+# Sacamos "Adelanto Cta Cte" porque las series del BCRA (IDs 13, 145, 1199)
+# reflejan promedios mayoristas que subestiman el costo retail real - mostrar
+# 25-47% cuando un cuentacorrentista de a pie paga >100% TNA es engañoso.
+# Mantener solo las 4 que sí reflejan realidad consumidor/PyME.
 # IDs validados en abril 2026 — series mensuales (1 dato por mes, fin de mes).
-# Hipotecario: el BCRA no publica una serie pura UVA. El BNA bloquea scraping.
-# Usamos hardcoded la TNA REAL UVA del Banco Nación. Para hacerla comparable con
-# las otras tasas (todas nominales) la convertimos a TNA NOMINAL multiplicando
-# por (1+inflación esperada). Si no hay inflación REM, asumimos IPC interanual.
 TASAS_FIN_BCRA_IDS = {
-    "adelanto_cta_cte":  1199,  # Adelantos en cta cte a tasa fija
     "tarjeta_credito":   1215,  # Financiaciones con tarjetas de crédito
     "prestamo_personal": 1219,  # Préstamos personales a tasa fija
     "sgr_cheque":        1216,  # Documentos a sola firma a tasa fija
@@ -760,21 +771,15 @@ TASA_HIPOTECARIO_BNA_TNA_REAL = 4.5
 
 def fetch_tasas_financiamiento_bcra():
     """
-    Pide las 4 tasas de financiamiento al BCRA v4 (series mensuales).
+    Pide las 3 tasas BCRA + hipotecario hardcoded.
     Hipotecario UVA: la TNA "real" del BNA (4.5%) se convierte a TNA NOMINAL
-    componiendo con la inflación esperada. Esto la hace comparable con las
-    otras tasas que ya son nominales.
-    
-    El cálculo nominal se hace en una etapa posterior (cuando ya tengamos
-    `rem` o `ipc_yoy`), así que acá devolvemos solo la TNA real y dejamos
-    placeholder. La conversión final se hace abajo.
+    componiendo con la inflación esperada (más abajo, cuando esté `rem`).
     """
     out = {}
     for nombre, id_var in TASAS_FIN_BCRA_IDS.items():
         out[nombre] = get_tasa_actual(id_var)
-    # Placeholder: se ajusta más abajo con la inflación esperada
-    out["hipotecario_uva"] = None  # se setea después
-    out["_hipotecario_uva_real"] = TASA_HIPOTECARIO_BNA_TNA_REAL  # guardar el dato bruto
+    out["hipotecario_uva"] = None  # se setea después con rem
+    out["_hipotecario_uva_real"] = TASA_HIPOTECARIO_BNA_TNA_REAL
     return out
 
 
@@ -810,7 +815,7 @@ def get_bench(months):
 
 bench_1m = get_bench(1)
 bench_1a = get_bench(12)
-print(f"  ✓ Bench 1M: {bench_1m}% | 1A: {bench_1a}%")
+print(f"  ✓ Bench 1M: {bench_1m}% | 1A (histórico): {bench_1a}%")
 
 # FIX: si bench es None, usar 0 como fallback para que la tabla aparezca
 # (mejor mostrar tabla con benchmark conservador que tabla vacía)
@@ -820,6 +825,12 @@ if bench_1m is None:
 if bench_1a is None:
     bench_1a = 0.0
     print(f"  ⚠ bench_1a=None → fallback 0.0 para no romper tabla")
+
+# bench_1a_esperado se calcula más adelante (cuando ya tengamos `rem`).
+# Es el equivalente de bench_1a pero usando devaluación ESPERADA en lugar de
+# histórica. Se usa en la tabla de financiamiento (que mira hacia adelante).
+# Inicialización conservadora; el valor real se setea después.
+bench_1a_esperado = bench_1a
 
 
 def tasa_a_retorno_real_usd(tna, meses, bench_pct):
@@ -1823,10 +1834,23 @@ try:
 except Exception:
     pass
 
+# Calcular bench_1a_esperado: equivalente de bench_1a pero con dev ESPERADA REM.
+# Es el "rendimiento real en USD que tendrían los pesos quietos los próximos 12m
+# si se cumple la inflación esperada y la devaluación esperada del REM".
+# Usado en tabla de financiamiento para que el spread tenga sentido contra el costo proyectado.
+try:
+    inf_esp = rem.get("inflacion_12m")  # % esperado próximos 12m según REM
+    if inf_esp is not None and dev_esperada_12m is not None:
+        ipc_acc_esp = float(inf_esp) / 100
+        dev_esp = dev_esperada_12m / 100
+        bench_1a_esperado = round((((1 + ipc_acc_esp) / (1 + dev_esp)) - 1) * 100, 2)
+        print(f"  • Bench 1A esperado (inflación REM vs dev REM): {bench_1a_esperado}%")
+except Exception:
+    pass
+
 # Convertir TNA real UVA a TNA nominal usando inflación esperada
 # Fórmula: (1 + tna_real) × (1 + inflación) - 1
 # Esto hace que el hipotecario UVA sea comparable con el resto de tasas (todas nominales).
-# Sin esta conversión, el cálculo de costo en USD daba un signo invertido.
 inflacion_para_uva = rem.get("inflacion_12m") or ipc_yoy
 if inflacion_para_uva and tasas_fin.get("_hipotecario_uva_real") is not None:
     tna_real = tasas_fin["_hipotecario_uva_real"] / 100
@@ -1841,7 +1865,6 @@ else:
 
 
 financiamiento_1m = {
-    "Adelanto Cta Cte": costo_fin_usd(tasas_fin["adelanto_cta_cte"], 1, bench_1m),
     "Tarjeta crédito": costo_fin_usd(tasas_fin["tarjeta_credito"], 1, bench_1m),
     "Préstamo Personal": costo_fin_usd(tasas_fin["prestamo_personal"], 1, bench_1m),
     "Hipotecario UVA": costo_fin_usd(tasas_fin["hipotecario_uva"], 1, bench_1m),
@@ -1850,11 +1873,10 @@ financiamiento_1m = {
 
 # Para horizonte 12m: pasamos dev esperada REM si está disponible
 financiamiento_1a = {
-    "Adelanto Cta Cte": costo_fin_usd(tasas_fin["adelanto_cta_cte"], 12, bench_1a, dev_esperada_12m),
-    "Tarjeta crédito": costo_fin_usd(tasas_fin["tarjeta_credito"], 12, bench_1a, dev_esperada_12m),
-    "Préstamo Personal": costo_fin_usd(tasas_fin["prestamo_personal"], 12, bench_1a, dev_esperada_12m),
-    "Hipotecario UVA": costo_fin_usd(tasas_fin["hipotecario_uva"], 12, bench_1a, dev_esperada_12m),
-    "Cheques SGR descuento": costo_fin_usd(tasas_fin["sgr_cheque"], 12, bench_1a, dev_esperada_12m),
+    "Tarjeta crédito": costo_fin_usd(tasas_fin["tarjeta_credito"], 12, bench_1a_esperado, dev_esperada_12m),
+    "Préstamo Personal": costo_fin_usd(tasas_fin["prestamo_personal"], 12, bench_1a_esperado, dev_esperada_12m),
+    "Hipotecario UVA": costo_fin_usd(tasas_fin["hipotecario_uva"], 12, bench_1a_esperado, dev_esperada_12m),
+    "Cheques SGR descuento": costo_fin_usd(tasas_fin["sgr_cheque"], 12, bench_1a_esperado, dev_esperada_12m),
 }
 
 
@@ -2244,6 +2266,7 @@ insights_df = pd.DataFrame({
     "analisis_global": [analisis_global],
     "bench_1m": [bench_1m if bench_1m is not None else ""],
     "bench_1a": [bench_1a if bench_1a is not None else ""],
+    "bench_1a_esperado": [bench_1a_esperado if bench_1a_esperado is not None else ""],
     "ipc_mes": [ipc_mes if ipc_mes is not None else ""],
     "ipc_yoy": [ipc_yoy if ipc_yoy is not None else ""],
     "ipc_accel_pp": [ipc_accel if ipc_accel is not None else ""],
