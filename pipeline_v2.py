@@ -1284,19 +1284,37 @@ def fetch_rem_endpoint(endpoint, max_intentos=4):
 
 def _rem_parse_periodo(p):
     """
-    Parsea el campo 'período' de una fila REM.
+    Parsea el campo 'periodo' de una fila REM.
+
+    FIX V25: la API de Allia (bcra-rem-api.facujallia.workers.dev) devuelve
+    el campo como 'periodo' (sin tilde), formato "YYYY-MM" (largo 7) para
+    proyecciones mensuales, "YYYY" (largo 4) para anuales, y strings descriptivos
+    para horizontes ("próx. 12 meses", "próx. 24 meses").
+    Bug previo: el parser pedía len >= 10 lo cual rechazaba el formato real.
+
     Devuelve ('anio', int) | ('fecha', Timestamp) | ('str', texto_lower).
-    Orden CRÍTICO: int antes que to_datetime (si no, 2026 se vuelve fecha inválida).
+    Orden CRÍTICO: int antes que to_datetime.
     """
     if isinstance(p, (int, float)) and not isinstance(p, bool):
         ival = int(p)
         if 2020 <= ival <= 2040:
             return ("anio", ival)
-    if isinstance(p, str) and "-" in p and len(p) >= 10:
-        try:
-            return ("fecha", pd.to_datetime(p, errors="raise"))
-        except Exception:
-            pass
+    if isinstance(p, str):
+        s = p.strip()
+        # YYYY → año
+        if len(s) == 4 and s.isdigit():
+            ival = int(s)
+            if 2020 <= ival <= 2040:
+                return ("anio", ival)
+        # YYYY-MM o YYYY-MM-DD → fecha (acepta largos 7 y 10)
+        if "-" in s and len(s) >= 7:
+            try:
+                # Si viene "YYYY-MM" lo normalizamos a primer día de mes
+                if len(s) == 7:
+                    return ("fecha", pd.to_datetime(s + "-01", errors="raise"))
+                return ("fecha", pd.to_datetime(s, errors="raise"))
+            except Exception:
+                pass
     return ("str", str(p).strip().lower())
 
 
@@ -1306,6 +1324,9 @@ def _rem_extraer(datos, hoy=None):
     Filas tipo 'fecha' → forward curve mensual
     Filas tipo 'str' → "próx. 12 meses" / "próx. 24 meses"
     Filas tipo 'anio' → cierre dic-YYYY
+
+    FIX V25: lee el campo 'periodo' (sin tilde) que es el real de la API.
+    Antes leía 'período' y devolvía None silenciosamente.
     """
     if hoy is None:
         hoy = pd.Timestamp.now("UTC").tz_localize(None).normalize()
@@ -1324,7 +1345,10 @@ def _rem_extraer(datos, hoy=None):
 
     forward_rows = []
     for row in datos:
-        p = row.get("período")
+        # FIX V25: aceptar tanto 'periodo' (correcto) como 'período' (legacy)
+        p = row.get("periodo")
+        if p is None:
+            p = row.get("período")
         mediana = row.get("mediana")
         if mediana is None:
             continue
@@ -1396,6 +1420,30 @@ def fetch_rem_api():
         out["inflacion_cierre_anio_prox"] = ext["cierre_anio_prox"]
         out["ipc_forward"] = ext["forward_curve"]
 
+    # FIX V25: si la API solo devuelve forward mensual y NO el agregado 12m/24m,
+    # lo calculamos componiendo las inflaciones mensuales (lo correcto).
+    # Inflación acumulada N meses = (∏(1 + m_i) - 1) * 100, con m_i en %.
+    if out["inflacion_12m"] is None and len(out["ipc_forward"]) >= 12:
+        try:
+            valores = [float(p["mediana"]) / 100 for p in out["ipc_forward"][:12]]
+            acc = 1.0
+            for v in valores:
+                acc *= (1 + v)
+            out["inflacion_12m"] = round((acc - 1) * 100, 2)
+            print(f"  • inflacion_12m derivada de forward (12 meses): {out['inflacion_12m']}%")
+        except Exception as e:
+            print(f"  ⚠ No se pudo derivar inflacion_12m: {e}")
+    if out["inflacion_24m"] is None and len(out["ipc_forward"]) >= 24:
+        try:
+            valores = [float(p["mediana"]) / 100 for p in out["ipc_forward"][:24]]
+            acc = 1.0
+            for v in valores:
+                acc *= (1 + v)
+            out["inflacion_24m"] = round((acc - 1) * 100, 2)
+            print(f"  • inflacion_24m derivada de forward (24 meses): {out['inflacion_24m']}%")
+        except Exception as e:
+            print(f"  ⚠ No se pudo derivar inflacion_24m: {e}")
+
     time.sleep(8)
 
     # Tipo de cambio
@@ -1409,6 +1457,22 @@ def fetch_rem_api():
         out["tc_cierre_anio_prox"] = ext["cierre_anio_prox"]
         out["tc_forward"] = ext["forward_curve"]
 
+    # FIX V25: para TC, los valores son en pesos por dólar (NO porcentaje).
+    # tc_12m = el valor proyectado mensual ~12 meses adelante.
+    # Si la API no lo expone como agregado, tomamos el punto 12 de la forward curve.
+    if out["tc_12m"] is None and len(out["tc_forward"]) >= 12:
+        try:
+            out["tc_12m"] = float(out["tc_forward"][11]["mediana"])
+            print(f"  • tc_12m derivado de forward (mes 12): ${out['tc_12m']}")
+        except Exception:
+            pass
+    if out["tc_24m"] is None and len(out["tc_forward"]) >= 24:
+        try:
+            out["tc_24m"] = float(out["tc_forward"][23]["mediana"])
+            print(f"  • tc_24m derivado de forward (mes 24): ${out['tc_24m']}")
+        except Exception:
+            pass
+
     time.sleep(8)
 
     # Tasa de interés
@@ -1421,6 +1485,15 @@ def fetch_rem_api():
         out["tasa_cierre_anio"] = ext["cierre_anio"]
         out["tasa_cierre_anio_prox"] = ext["cierre_anio_prox"]
         out["tasa_forward"] = ext["forward_curve"]
+
+    # FIX V25: tasa REM es TNA mensual proyectada. Si no hay agregado 12m,
+    # tomamos el valor del mes 12 de la curva forward (TNA del mes 12).
+    if out["tasa_12m"] is None and len(out["tasa_forward"]) >= 12:
+        try:
+            out["tasa_12m"] = float(out["tasa_forward"][11]["mediana"])
+            print(f"  • tasa_12m derivada de forward (mes 12): {out['tasa_12m']}%")
+        except Exception:
+            pass
 
     time.sleep(8)
 
@@ -1509,14 +1582,22 @@ vencimientos_deuda = vencimientos_deuda_publica()
 # ---------------------------------------------------------------
 print("\n[Noticias] RSS + scoring...")
 
+# FIX V25: Infobae soporta múltiples URLs por medio (lista) con fallback automático.
+# El feed antiguo /feeds/rss/economia/ devuelve 404 desde 2025. Probamos varias
+# alternativas (Arc Publishing outboundfeeds + feed legacy + página de sección)
+# y nos quedamos con la primera que devuelva entries.
 RSS_SOURCES = {
-    "Ámbito": "https://www.ambito.com/rss/pages/economia.xml",
-    "Infobae": "https://www.infobae.com/feeds/rss/economia/",
-    "Cronista": "https://www.cronista.com/files/rss/economia.xml",
-    "iProfesional": "https://www.iprofesional.com/rss",
-    "El Economista": "https://eleconomista.com.ar/arc/outboundfeeds/rss/?outputType=xml",
-    "Investing": "https://es.investing.com/rss/news_25.rss",
-    "Perfil": "https://www.perfil.com/feed/economia",
+    "Ámbito": ["https://www.ambito.com/rss/pages/economia.xml"],
+    "Infobae": [
+        "https://www.infobae.com/arc/outboundfeeds/rss/category/economia/?outputType=xml",
+        "https://www.infobae.com/feeds/rss/economia/",
+        "https://www.infobae.com/adjuntos/html/RSS/economia.xml",
+    ],
+    "Cronista": ["https://www.cronista.com/files/rss/economia.xml"],
+    "iProfesional": ["https://www.iprofesional.com/rss"],
+    "El Economista": ["https://eleconomista.com.ar/arc/outboundfeeds/rss/?outputType=xml"],
+    "Investing": ["https://es.investing.com/rss/news_25.rss"],
+    "Perfil": ["https://www.perfil.com/feed/economia"],
 }
 
 KEYWORDS_ALTA = [
@@ -1594,12 +1675,25 @@ def score_noticia(titulo, resumen, fecha_pub):
 
 
 noticias = []
-for medio, url in RSS_SOURCES.items():
-    try:
-        feed = feedparser.parse(url)
-        entries = feed.entries[:15]
-        if not entries:
+for medio, urls in RSS_SOURCES.items():
+    # FIX V25: aceptar tanto string como lista de URLs (fallback automático)
+    urls_list = urls if isinstance(urls, list) else [urls]
+    feed = None
+    url_usada = None
+    for url in urls_list:
+        try:
+            feed_try = feedparser.parse(url)
+            if feed_try.entries:
+                feed = feed_try
+                url_usada = url
+                break
+        except Exception:
             continue
+    if feed is None or not feed.entries:
+        print(f"  ✗ {medio}: ningún feed devolvió entries (probadas {len(urls_list)} URLs)")
+        continue
+    try:
+        entries = feed.entries[:15]
         for e in entries:
             fecha = parse_date_safe(e)
             horas = (datetime.now() - fecha).total_seconds() / 3600
@@ -1616,7 +1710,7 @@ for medio, url in RSS_SOURCES.items():
                 "fecha": fecha.isoformat(),
                 "score": score_noticia(titulo, resumen, fecha),
             })
-        print(f"  ✓ {medio}: {len(entries)}")
+        print(f"  ✓ {medio}: {len(entries)} (de {url_usada[:60]})")
     except Exception as ex:
         print(f"  ✗ {medio}: {ex}")
 
@@ -1848,27 +1942,92 @@ try:
 except Exception:
     pass
 
+# FIX V25: bench_1m_esperado = equivalente mensual al 1A_esperado.
+# Antes la tabla de financiamiento mensual usaba bench_1m (histórico, retroactivo),
+# lo cual era inconsistente con el 1A que sí usaba bench_1a_esperado.
+# Ahora ambas tablas de financiamiento usan benchmark forward-looking.
+# Estrategia: tomar inflación REM 1m (si está) o desanualizar la 12m, idem dev.
+bench_1m_esperado = bench_1m  # fallback por defecto al histórico
+try:
+    # 1) Inflación esperada 1m: priorizar dato directo REM, sino desanualizar 12m
+    # FIX V25: la clave correcta es 'inflacion_mensual_proxima' (la primera fila de la
+    # forward curve, que es el próximo mes calendario REM). Antes se buscaba 'inflacion_1m'
+    # que nunca existió.
+    inf_1m_esp = None
+    if isinstance(rem, dict):
+        inf_1m_esp = rem.get("inflacion_mensual_proxima") or rem.get("inflacion_1m")
+    if inf_1m_esp is None and rem.get("inflacion_12m") is not None:
+        # Desanualizar: (1+anual)^(1/12) - 1
+        inf_12m = float(rem["inflacion_12m"]) / 100
+        inf_1m_esp = ((1 + inf_12m) ** (1 / 12) - 1) * 100
+
+    # 2) Devaluación esperada 1m: priorizar tc_forward primer punto, sino desanualizar 12m
+    dev_1m_esp = None
+    tc_forward_local = rem.get("tc_forward") if isinstance(rem, dict) else None
+    if tc_forward_local and isinstance(tc_forward_local, list) and len(tc_forward_local) > 0:
+        try:
+            tc_1m = float(tc_forward_local[0].get("mediana", 0))
+            usd_spot_actual_l = float(macro_dfs["oficial"]["USD_Oficial"].iloc[-1])
+            if tc_1m > 0 and usd_spot_actual_l > 0:
+                dev_1m_esp = ((tc_1m / usd_spot_actual_l) - 1) * 100
+        except Exception:
+            pass
+    if dev_1m_esp is None and dev_esperada_12m is not None:
+        # Desanualizar dev 12m → 1m
+        dev_12m = dev_esperada_12m / 100
+        dev_1m_esp = ((1 + dev_12m) ** (1 / 12) - 1) * 100
+
+    if inf_1m_esp is not None and dev_1m_esp is not None:
+        bench_1m_esperado = round((((1 + inf_1m_esp / 100) / (1 + dev_1m_esp / 100)) - 1) * 100, 2)
+        print(f"  • Bench 1M esperado (inflación esp 1m vs dev esp 1m): {bench_1m_esperado}%")
+except Exception as e:
+    print(f"  ⚠ No se pudo calcular bench_1m_esperado: {e}")
+
 # Convertir TNA real UVA a TNA nominal usando inflación esperada
-# Fórmula: (1 + tna_real) × (1 + inflación) - 1
-# Esto hace que el hipotecario UVA sea comparable con el resto de tasas (todas nominales).
+# FIX V25: fórmula simple por pedido del usuario: TNA_nominal = 4.5 + inflación_esperada_12m
+# Esta es la aproximación lineal estándar (no la composición Fisher), más conservadora
+# y más legible. Para UVA mensual usamos inflación esperada / 12 (anualizada → mensual proxy).
 inflacion_para_uva = rem.get("inflacion_12m") or ipc_yoy
 if inflacion_para_uva and tasas_fin.get("_hipotecario_uva_real") is not None:
-    tna_real = tasas_fin["_hipotecario_uva_real"] / 100
-    inf = float(inflacion_para_uva) / 100
-    tasas_fin["hipotecario_uva"] = round(((1 + tna_real) * (1 + inf) - 1) * 100, 2)
-    print(f"  • Hipotecario UVA: real={tna_real*100:.1f}% × inf={inf*100:.1f}% → nominal={tasas_fin['hipotecario_uva']}%")
+    tna_real_pct = tasas_fin["_hipotecario_uva_real"]  # 4.5
+    inf_pct = float(inflacion_para_uva)
+    tasas_fin["hipotecario_uva"] = round(tna_real_pct + inf_pct, 2)
+    print(f"  • Hipotecario UVA: {tna_real_pct}% real + {inf_pct:.1f}% inf esperada = {tasas_fin['hipotecario_uva']}% TNA nominal")
 else:
     # Fallback: si no tenemos inflación, asumimos 30% (proxy 2026)
-    tna_real = (tasas_fin.get("_hipotecario_uva_real") or 4.5) / 100
-    tasas_fin["hipotecario_uva"] = round(((1 + tna_real) * 1.30 - 1) * 100, 2)
-    print(f"  ⚠ Hipotecario UVA: sin inflación esperada, uso fallback 30% → nominal={tasas_fin['hipotecario_uva']}%")
+    tna_real_pct = tasas_fin.get("_hipotecario_uva_real") or 4.5
+    tasas_fin["hipotecario_uva"] = round(tna_real_pct + 30.0, 2)
+    print(f"  ⚠ Hipotecario UVA: sin inflación esperada, uso fallback 30% → {tasas_fin['hipotecario_uva']}% TNA nominal")
 
+
+# FIX V25: financiamiento_1m ahora usa bench_1m_esperado y dev esperada mensual.
+# Antes inversiones y financiamiento mensuales compartían bench_1m (histórico),
+# generando el "mismo número" en ambas tablas. Ahora son distintos:
+#   - inversiones 1m → bench_1m (histórico, retorno realizado)
+#   - financiamiento 1m → bench_1m_esperado (forward-looking, costo proyectado)
+# Calculamos dev esperada mensual con la misma lógica del bench_1m_esperado.
+dev_esperada_1m = None
+try:
+    tc_forward_local = rem.get("tc_forward") if isinstance(rem, dict) else None
+    if tc_forward_local and isinstance(tc_forward_local, list) and len(tc_forward_local) > 0:
+        try:
+            tc_1m = float(tc_forward_local[0].get("mediana", 0))
+            usd_spot_actual_l = float(macro_dfs["oficial"]["USD_Oficial"].iloc[-1])
+            if tc_1m > 0 and usd_spot_actual_l > 0:
+                dev_esperada_1m = ((tc_1m / usd_spot_actual_l) - 1) * 100
+        except Exception:
+            pass
+    if dev_esperada_1m is None and dev_esperada_12m is not None:
+        dev_12m = dev_esperada_12m / 100
+        dev_esperada_1m = ((1 + dev_12m) ** (1 / 12) - 1) * 100
+except Exception:
+    pass
 
 financiamiento_1m = {
-    "Tarjeta crédito": costo_fin_usd(tasas_fin["tarjeta_credito"], 1, bench_1m),
-    "Préstamo Personal": costo_fin_usd(tasas_fin["prestamo_personal"], 1, bench_1m),
-    "Hipotecario UVA": costo_fin_usd(tasas_fin["hipotecario_uva"], 1, bench_1m),
-    "Cheques SGR descuento": costo_fin_usd(tasas_fin["sgr_cheque"], 1, bench_1m),
+    "Tarjeta crédito": costo_fin_usd(tasas_fin["tarjeta_credito"], 1, bench_1m_esperado, dev_esperada_1m),
+    "Préstamo Personal": costo_fin_usd(tasas_fin["prestamo_personal"], 1, bench_1m_esperado, dev_esperada_1m),
+    "Hipotecario UVA": costo_fin_usd(tasas_fin["hipotecario_uva"], 1, bench_1m_esperado, dev_esperada_1m),
+    "Cheques SGR descuento": costo_fin_usd(tasas_fin["sgr_cheque"], 1, bench_1m_esperado, dev_esperada_1m),
 }
 
 # Para horizonte 12m: pasamos dev esperada REM si está disponible
@@ -2049,22 +2208,38 @@ REGLAS: respetar signos de etiquetas, no opinar política, rioplatense, sin emoj
 
 
 def build_prompt_expectativas():
+    # FIX V25: helpers None-safe para que None no se inyecte como string "None" en el prompt.
+    def f_pct(v, dec=2):
+        try:
+            return f"{float(v):+.{dec}f}%" if v is not None and v != "" else "N/D"
+        except (ValueError, TypeError):
+            return "N/D"
+
+    def f_num(v, dec=2):
+        try:
+            return f"{float(v):.{dec}f}" if v is not None and v != "" else "N/D"
+        except (ValueError, TypeError):
+            return "N/D"
+
     fut_txt = ", ".join([f"{f['vencimiento']}:${f['precio']}" for f in rofex_futuros[:6]]) if rofex_futuros else "sin datos ROFEX"
-    usd_spot = snapshots["usd_oficial"]["val"] if snapshots["usd_oficial"] else "?"
+    usd_spot = snapshots["usd_oficial"]["val"] if snapshots.get("usd_oficial") else "N/D"
+    rem_inf_12m = rem.get('inflacion_12m', None) if isinstance(rem, dict) else None
+    rem_tc_12m = rem.get('tc_12m', None) if isinstance(rem, dict) else None
+    rem_tasa_12m = rem.get('tasa_12m', None) if isinstance(rem, dict) else None
 
     return f"""Analista argentino. Datos expectativas de mercado:
 
 Dólar spot: ${usd_spot}
 Futuros ROFEX: {fut_txt}
-Ratio 12m/spot: {ratio_dolar_12m_spot}x
-Devaluación implícita 12m: {dev_anualizada_implicita}%
-REM inflación 12m: {rem.get('inflacion_12m', 'N/D')}%
-REM TC 12m esperado: ${rem.get('tc_12m', 'N/D')}
-REM tasa 12m: {rem.get('tasa_12m', 'N/D')}%
-Plazo fijo TNA: {tasa_plazo_fijo}%
-Tasa real esperada: {tasa_real_esperada}%
-Reservas BCRA: USD {reservas_actual}M (1M: {reservas_delta_1m}%, 1A: {reservas_delta_1a}%)
-Riesgo país: {rp_arg} bps
+Ratio 12m/spot: {f_num(ratio_dolar_12m_spot)}x
+Devaluación implícita 12m: {f_pct(dev_anualizada_implicita, 1)}
+REM inflación 12m: {f_pct(rem_inf_12m, 1)}
+REM TC 12m esperado: ${f_num(rem_tc_12m, 0)}
+REM tasa 12m: {f_pct(rem_tasa_12m, 1)}
+Plazo fijo TNA: {f_pct(tasa_plazo_fijo, 1)}
+Tasa real esperada: {f_pct(tasa_real_esperada, 2)}
+Reservas BCRA: USD {f_num(reservas_actual, 0)}M (1M: {f_pct(reservas_delta_1m, 1)}, 1A: {f_pct(reservas_delta_1a, 1)})
+Riesgo país: {rp_arg if rp_arg is not None else 'N/D'} bps
 
 3 oraciones:
 1. Qué devaluación espera mercado (dev implícita vs inflación esperada → dev real).
@@ -2231,8 +2406,42 @@ resp_global = parsear_json(llamar_gemini(build_prompt_macro_global())) or {}
 analisis_global = resp_global.get("analisis_global", "Sin análisis disponible")
 
 print("  → Llamada 7: expectativas...")
-resp_exp = parsear_json(llamar_gemini(build_prompt_expectativas())) or {}
-analisis_expectativas = resp_exp.get("analisis_expectativas", "Sin análisis disponible")
+# FIX V25: log del prompt size, fallback a Pro si Flash falla, y log de qué devolvió.
+prompt_exp = build_prompt_expectativas()
+print(f"     prompt size: {len(prompt_exp)} chars")
+resp_exp_txt = llamar_gemini(prompt_exp, intentos=2, model=GEMINI_MODEL_FLASH)
+if not resp_exp_txt:
+    print("     → Fallback a Pro...")
+    resp_exp_txt = llamar_gemini(prompt_exp, intentos=2, model=GEMINI_MODEL_PRO)
+resp_exp = parsear_json(resp_exp_txt) or {}
+analisis_expectativas = resp_exp.get("analisis_expectativas", "")
+if not analisis_expectativas:
+    # Último recurso: armar análisis determinístico mínimo con los datos disponibles
+    partes = []
+    if dev_anualizada_implicita is not None and rem.get("inflacion_12m"):
+        try:
+            dev_real_imp = dev_anualizada_implicita - float(rem["inflacion_12m"])
+            partes.append(
+                f"El mercado prevé una devaluación implícita 12m del {dev_anualizada_implicita:.1f}% "
+                f"vs inflación REM {float(rem['inflacion_12m']):.1f}%, "
+                f"lo que implica una devaluación real {'positiva' if dev_real_imp > 0 else 'negativa'} de {dev_real_imp:+.1f} pp."
+            )
+        except Exception:
+            pass
+    if tasa_real_esperada is not None:
+        partes.append(
+            f"La tasa real esperada del plazo fijo es {tasa_real_esperada:+.2f}%, "
+            f"{'preservando' if tasa_real_esperada > 0 else 'erosionando'} poder de compra en pesos."
+        )
+    if reservas_delta_1a is not None and rp_arg is not None:
+        partes.append(
+            f"Reservas {('crecen' if reservas_delta_1a > 0 else 'caen')} {reservas_delta_1a:+.1f}% en 12m "
+            f"con riesgo país en {rp_arg} bps."
+        )
+    analisis_expectativas = " ".join(partes) if partes else "Sin análisis disponible (LLM y datos insuficientes)."
+    print(f"     ⚠ LLM falló, uso fallback determinístico ({len(analisis_expectativas)} chars)")
+else:
+    print(f"     ✓ análisis recibido ({len(analisis_expectativas)} chars)")
 
 
 # ---------------------------------------------------------------
@@ -2265,6 +2474,7 @@ insights_df = pd.DataFrame({
     "analisis_expectativas": [analisis_expectativas],
     "analisis_global": [analisis_global],
     "bench_1m": [bench_1m if bench_1m is not None else ""],
+    "bench_1m_esperado": [bench_1m_esperado if bench_1m_esperado is not None else ""],
     "bench_1a": [bench_1a if bench_1a is not None else ""],
     "bench_1a_esperado": [bench_1a_esperado if bench_1a_esperado is not None else ""],
     "ipc_mes": [ipc_mes if ipc_mes is not None else ""],
