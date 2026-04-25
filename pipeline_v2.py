@@ -198,7 +198,26 @@ EMAE_XLS_URL = "https://www.indec.gob.ar/ftp/cuadros/economia/sh_emae_mensual_ba
 def fetch_emae_from_indec_xls():
     """
     Descarga el XLS oficial del EMAE base 2004 directo del INDEC.
-    Estructura típica: header en filas 1-3, después columnas con períodos y valores.
+    
+    FIX V23: el parser anterior fallaba por dos razones:
+    1) Probaba columnas 1-5 secuencialmente y se quedaba con la PRIMERA numérica
+       válida → agarraba la SERIE ORIGINAL (col 2) en vez de DESESTACIONALIZADA (col 4)
+    2) Tenía un bug latente: la columna 1 contiene el mes en TEXTO, así que el
+       primer "first_val numérico" siempre era col 2. Pero esto pasaba para todas
+       las filas, así que ni siquiera era el bug declarado en el log.
+    
+    Estructura confirmada del Excel (validado en Colab abril 2026):
+      col 0: Año (solo poblada en filas de enero)
+      col 1: Mes en español ("Enero", "Febrero", ...)
+      col 2: Índice Serie Original (con estacionalidad)
+      col 3: Var % i.a. de la serie original
+      col 4: Índice Serie DESESTACIONALIZADA  ← LA QUE USAMOS
+      col 5: Var % m/m de la desestacionalizada
+      col 6: Índice Serie Tendencia-Ciclo
+      col 7: Var % m/m de la tendencia
+    
+    La serie desestacionalizada es la que reporta INDEC en sus comunicados de
+    prensa y la estándar para análisis de coyuntura.
     """
     try:
         r = requests.get(EMAE_XLS_URL, headers=HEADERS, timeout=60, verify=False)
@@ -206,59 +225,65 @@ def fetch_emae_from_indec_xls():
             print(f"  ⚠ EMAE XLS HTTP {r.status_code}")
             return pd.DataFrame()
 
-        # Guardar a temp file
         tmp_path = "/tmp/emae_indec.xls"
         with open(tmp_path, "wb") as f:
             f.write(r.content)
 
-        # Leer con pandas (xlrd para .xls antiguo)
-        try:
-            xls = pd.ExcelFile(tmp_path, engine="xlrd")
-        except Exception:
-            xls = pd.ExcelFile(tmp_path)
+        # Probar engines en orden: xlrd para .xls antiguos, openpyxl si fuera .xlsx
+        df_raw = None
+        for engine in ["xlrd", "openpyxl"]:
+            try:
+                df_raw = pd.read_excel(tmp_path, sheet_name=0, header=None, engine=engine)
+                break
+            except Exception:
+                continue
+        if df_raw is None:
+            print(f"  ⚠ EMAE XLS: ningún engine pudo abrir el archivo")
+            return pd.DataFrame()
 
-        # La primera hoja típicamente contiene la serie original + desestacionalizada
-        sheet_name = xls.sheet_names[0]
-        df_raw = pd.read_excel(tmp_path, sheet_name=sheet_name, header=None)
+        meses_map = {
+            "enero": 1, "febrero": 2, "marzo": 3, "abril": 4,
+            "mayo": 5, "junio": 6, "julio": 7, "agosto": 8,
+            "septiembre": 9, "octubre": 10, "noviembre": 11, "diciembre": 12,
+        }
 
-        # Buscar la fila que contiene "Año" o el primer año (2004)
         rows = []
         anio_actual = None
-        for idx, row in df_raw.iterrows():
-            try:
-                # Detectar año (1ra columna numérica entre 2004 y 2030)
-                first_val = row.iloc[0]
-                if pd.notna(first_val):
-                    try:
-                        anio_int = int(float(str(first_val).strip()))
-                        if 2004 <= anio_int <= 2030:
-                            anio_actual = anio_int
-                            continue
-                    except Exception:
-                        pass
+        # Estructura conocida: año en col 0 (solo enero), mes en col 1, desest en col 4
+        for idx in range(len(df_raw)):
+            row = df_raw.iloc[idx]
 
-                # Detectar mes (1ra columna texto = enero, febrero, etc.)
-                if anio_actual and pd.notna(first_val):
-                    mes_str = str(first_val).strip().lower()
-                    meses_map = {
-                        "enero": 1, "febrero": 2, "marzo": 3, "abril": 4,
-                        "mayo": 5, "junio": 6, "julio": 7, "agosto": 8,
-                        "septiembre": 9, "octubre": 10, "noviembre": 11, "diciembre": 12,
-                    }
-                    if mes_str in meses_map:
-                        # Tomar el primer valor numérico de las siguientes columnas
-                        # Habitualmente la columna 1 es el índice nivel general original
-                        for col_idx in range(1, min(len(row), 6)):
-                            try:
-                                val = float(row.iloc[col_idx])
-                                if 50 < val < 300:  # Rangos plausibles para índice base 2004=100
-                                    rows.append({
-                                        "fecha": pd.Timestamp(year=anio_actual, month=meses_map[mes_str], day=1),
-                                        "EMAE": val,
-                                    })
-                                    break
-                            except Exception:
-                                continue
+            # ¿Hay año en columna 0?
+            v_anio = row.iloc[0]
+            if pd.notna(v_anio):
+                try:
+                    anio_int = int(float(str(v_anio).strip()))
+                    if 2004 <= anio_int <= 2030:
+                        anio_actual = anio_int
+                except Exception:
+                    pass
+
+            # ¿Hay mes en columna 1?
+            v_mes = row.iloc[1] if df_raw.shape[1] > 1 else None
+            if pd.isna(v_mes) or anio_actual is None:
+                continue
+            mes_str = str(v_mes).strip().lower()
+            mes_num = meses_map.get(mes_str)
+            if mes_num is None:
+                continue
+
+            # SIEMPRE columna 4 (desestacionalizada). Sin loop ni adivinanza.
+            if df_raw.shape[1] < 5:
+                continue
+            v_desest = row.iloc[4]
+            try:
+                val = float(v_desest)
+                if not (50 < val < 300):  # Sanity check: rango plausible base 2004=100
+                    continue
+                rows.append({
+                    "fecha": pd.Timestamp(year=anio_actual, month=mes_num, day=1),
+                    "EMAE": val,
+                })
             except Exception:
                 continue
 
@@ -269,7 +294,7 @@ def fetch_emae_from_indec_xls():
         df = pd.DataFrame(rows).drop_duplicates(subset=["fecha"]).sort_values("fecha").reset_index(drop=True)
         return df
     except Exception as e:
-        print(f"  ⚠ EMAE XLS error: {e}")
+        print(f"  ⚠ EMAE XLS error: {str(e)[:200]}")
         return pd.DataFrame()
 
 
