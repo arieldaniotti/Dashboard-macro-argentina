@@ -492,7 +492,9 @@ def render_salario_real_card():
         delta_color = "#94a3b8"
 
     # Subtítulo explicativo de metodología
-    subtexto = "Índice Salarios INDEC deflactado por IPC (12m)"
+    # FIX V25: ahora usamos IS_total_registrado (formales: privados blancos + estatales),
+    # más honesto que el Nivel General que arrastra a los informales.
+    subtexto = "Salarios formales (INDEC) deflactados por IPC (12m)"
 
     macro_card_integrated(
         "Salario real",
@@ -833,7 +835,9 @@ with tab_local:
     st.caption(
         "💡 **Salario real**: base 100 = índice del mes hace 12 meses. "
         "Valor >0% indica que los salarios crecieron más que la inflación acumulada. "
-        "Fuente: Índice de Salarios Nivel General (INDEC) deflactado por IPC."
+        "Fuente: Índice de Salarios INDEC, **trabajadores registrados** (privados en "
+        "blanco + sector público) deflactado por IPC. No incluye informales, "
+        "monotributistas ni jubilados."
     )
 
     lectura = get_insight("lectura_macro", "")
