@@ -320,16 +320,23 @@ SALARIOS_CSV_URL = "https://www.indec.gob.ar/ftp/cuadros/sociedad/indice_salario
 def fetch_salarios_indec():
     """
     CSV oficial INDEC con Índice de Salarios (base oct-2016 = 100).
-    FIX V22: V7 estaba tomando la columna incorrecta (IS_total_registrado por el
-    fallback "total") y parseaba fechas sin formato explícito, lo que en algunos
-    runners interpretaba DD/MM/YYYY como MM/DD/YYYY.
+
+    FIX V25: cambio de columna a `IS_total_registrado` (suma sector privado
+    registrado + sector público). Antes V22 usaba `IS_indice_total` (Nivel General)
+    que incluye al sector no registrado/informal. Esta serie suaviza artificialmente
+    las caídas porque el componente informal se actualiza con menor frecuencia.
+    El Nivel General mostraba +2.1% real cuando la percepción social era de pérdida —
+    un dato más honesto es mostrar lo que cobra un trabajador en blanco (paritarias).
+
+    `IS_total_registrado` deja afuera a:
+      - Trabajadores informales (~35% del empleo)
+      - Autónomos / monotributistas
+      - Jubilados (que tienen otro régimen de actualización)
+    Es lo que usan Cronista/Ámbito cuando reportan "salarios reales".
 
     Estructura real del CSV (verificado 2026-04):
       periodo; IS_sector_privado_registrado; IS_sector_publico;
       IS_total_registrado; IS_sector_no_registrado; IS_indice_total
-
-    Usamos IS_indice_total (Nivel General, dato oficial INDEC que citan
-    todos los analistas).
     """
     try:
         r = requests.get(SALARIOS_CSV_URL, headers=HEADERS, timeout=30, verify=False)
@@ -355,24 +362,32 @@ def fetch_salarios_indec():
             print(f"  ⚠ Salarios CSV: columna 'periodo' no encontrada. Cols: {list(df_raw.columns)}")
             return pd.DataFrame()
 
-        # Priorizar nombre exacto de nivel general
+        # FIX V25: priorizar `IS_total_registrado` (formales puros, sin informales)
         col_is = None
-        candidates_exact = ["IS_indice_total", "IS_indice_general", "indice_general", "nivel_general"]
+        candidates_exact = ["IS_total_registrado", "total_registrado"]
         for c in df_raw.columns:
             if str(c).strip() in candidates_exact:
                 col_is = c
                 break
 
-        # Fallback: buscar por contenido del nombre (sin matchear "total_registrado")
+        # Fallback 1: matching parcial sobre "total_registrado"
         if col_is is None:
             for c in df_raw.columns:
                 cl = str(c).lower().strip()
-                if "indice_total" in cl or "nivel_general" in cl or "indice_general" in cl:
+                if "total_registrado" in cl and "no_registrado" not in cl:
+                    col_is = c
+                    break
+
+        # Fallback 2: si no hay registrado, ir a sector privado registrado
+        if col_is is None:
+            for c in df_raw.columns:
+                cl = str(c).lower().strip()
+                if "privado_registrado" in cl:
                     col_is = c
                     break
 
         if col_is is None:
-            print(f"  ⚠ Salarios CSV: no encuentro columna nivel general. Cols: {list(df_raw.columns)}")
+            print(f"  ⚠ Salarios CSV: no encuentro columna registrado. Cols: {list(df_raw.columns)}")
             return pd.DataFrame()
 
         # Fecha con formato EXPLÍCITO dd/mm/yyyy (evita ambigüedad con locale US)
