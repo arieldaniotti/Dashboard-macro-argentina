@@ -583,8 +583,14 @@ if not df_is_raw.empty and not df_ipc.empty:
         inflacion_yoy_ventana = round((ipc_acum_yoy - 1) * 100, 2)
         print(f"  • Desglose: nominal={salario_nominal_yoy}% | inflación={inflacion_yoy_ventana}% → real={salario_real_yoy}%")
 
-        # === Trayectoria para gráfico: últimos 24 meses de índice real ===
-        tray_n = min(25, len(merged))
+        # === Trayectoria para gráfico: últimos 12 meses de índice real ===
+        # FIX V25: antes tomaba 24 meses (50 filas mensuales en realidad porque
+        # `tray_n = min(25, len(merged))` y luego se iteraba i=1..n-1 dando 24 puntos).
+        # Esto desalineaba el gráfico de salario real respecto a IPC y EMAE
+        # (ambos a 12m) y daba la falsa sensación de tendencia positiva al
+        # mostrar la recuperación post-shock 2023-2024 todavía dentro del frame.
+        # Ahora 13 filas (mes 0 base + 12 puntos) → mismo eje temporal que IPC/EMAE.
+        tray_n = min(13, len(merged))
         tray = merged.tail(tray_n).reset_index(drop=True)
         is_base_t = float(tray.iloc[0]["IS"])
         ipc_acum_t = 1.0
